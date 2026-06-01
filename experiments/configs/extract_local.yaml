@@ -1,0 +1,27 @@
+# Visual-token extraction — LOCAL machine (Mac / no flash-attn, small scale).
+# Run: python -m src.datasets.extract_visual_tokens --config experiments/configs/extract_local.yaml
+#
+# NOTE: Qwen3-VL-8B is heavy; on a laptop expect CPU/MPS-only and slow extraction.
+# Point these at a small local sample of videos for development.
+
+# paths (relative to repo root; data/ is gitignored)
+output_path: ./data/visual_tokens
+annotations_path: ./data/annotations.json
+hf_cache_dir: ./data/hf-cache
+model_id: Qwen/Qwen3-VL-8B-Instruct
+
+# video selection
+dataset_filter: ego4d
+video_ext: .mp4
+# no prefix remap locally: annotations already point at local paths
+path_remap: null
+
+# frame sampling
+target_fps: 1
+window_size: 16
+stride: 16
+target_resolution: [448, 256]   # (W, H)
+
+# runtime — flash-attn 2 is unavailable on Mac; falls back to default attention
+attn_implementation: null
+empty_cache_every: 32

@@ -1,0 +1,26 @@
+# Visual-token extraction — CLUSTER (VM with GPU + flash-attn).
+# Run: python -m src.datasets.extract_visual_tokens --config experiments/configs/extract_cluster.yaml
+
+# paths (edit to match the VM)
+output_path: /home/vllsmn02h03b202i/rosario/visual_tokens
+annotations_path: /home/vllsmn02h03b202i/rosario/annotations.json
+hf_cache_dir: /home/vllsmn02h03b202i/hf-cache
+model_id: Qwen/Qwen3-VL-8B-Instruct
+
+# video selection
+dataset_filter: ego4d
+video_ext: .mp4
+# translate annotation subfolder prefixes from the old base to the VM base
+path_remap:
+  old_base: /home/frtrsr00t18b428a/extra-space
+  new_base: /home/vllsmn02h03b202i/rosario/data
+
+# frame sampling (resolution halved -> ~4x fewer visual tokens)
+target_fps: 1
+window_size: 16
+stride: 16
+target_resolution: [448, 256]   # (W, H)
+
+# runtime
+attn_implementation: flash_attention_2
+empty_cache_every: 32

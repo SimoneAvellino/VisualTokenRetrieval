@@ -1,0 +1,75 @@
+# Training — LOCAL machine (Mac / CPU, small scale for development).
+# Run:  python -m src.training.train     --config experiments/configs/train_local.yaml
+# Eval: python -m src.evaluation.evaluate --config experiments/configs/train_local.yaml
+
+# paths (relative to repo root; data/ is gitignored)
+tokens_dir: ./data/visual_tokens/Ego4D
+annotations: ./data/annotations.json
+checkpoint_dir: ./experiments/checkpoints
+pretrained_compressor: ""
+recursive_tokens: false
+
+# device / runtime — auto picks cuda if present, else cpu (Mac -> cpu)
+device: auto
+dtype: fp32                    # no bf16 off-cuda
+num_workers: 0                 # 0 avoids macOS multiprocessing issues
+seed: 42
+
+# token loading
+pool_to_fps: 1
+
+# GT window augmentation
+gt_max_left_pad: 30.0
+gt_max_right_pad: 30.0
+gt_window_zero_dur_pad: 5.0
+gt_exact_prob: 0.2
+
+# CLIP
+clip_model: openai/clip-vit-large-patch14
+max_question_len: 77
+
+# data (smaller sequences to fit a laptop)
+context_strategy: full_until_query
+random_crop_extra_min: 16
+random_crop_extra_max: 128
+max_seq_len: 256
+out_len: 32
+val_ratio: 0.2
+test_ratio: 0.2
+
+# model (embed_dim must equal the extracted token hidden size)
+embed_dim: 4096
+num_heads: 8
+num_queries: 16
+decoder_layers: 2
+dropout: 0.1
+memory_mode: z
+xlstm_num_blocks: 2
+xlstm_slstm_at: [1]
+freeze_compressor: false
+
+# optimization
+batch_size: 1
+gradient_accumulation_steps: 4
+epochs: 3
+learning_rate: 5.0e-5
+weight_decay: 1.0e-2
+grad_clip: 1.0
+
+# loss
+cosine_weight: 0.1
+infonce_weight: 0.0
+infonce_temperature: 0.07
+
+# logging
+use_wandb: false
+wandb_project: query-gt-token-reconstruction
+wandb_mode: disabled
+
+# control flow
+dry_run: false
+resume: ""
+
+# evaluation (used by src.evaluation.evaluate)
+eval_checkpoint: ""
+eval_split: test

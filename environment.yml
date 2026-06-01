@@ -19,4 +19,11 @@ dependencies:
       - pyyaml
       - tensorboard
       - tqdm
+      # --- project deps ---
+      - transformers        # Qwen3-VL + CLIP text encoder/tokenizer
+      - opencv-python        # video frame decoding (cv2)
+      - pillow               # frame -> PIL.Image
+      - xlstm                # xLSTM block stack (token compressor)
+      - wandb                # optional run logging
+      # - flash-attn         # cluster-only; install on the GPU VM if available
       # Add other pip-only packages here

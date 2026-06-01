@@ -1,0 +1,75 @@
+# Training — CLUSTER (VM with GPU).
+# Run:  python -m src.training.train     --config experiments/configs/train_cluster.yaml
+# Eval: python -m src.evaluation.evaluate --config experiments/configs/train_cluster.yaml
+
+# paths (edit to match the VM)
+tokens_dir: /home/vllsmn02h03b202i/rosario/visual_tokens/Ego4D
+annotations: /home/vllsmn02h03b202i/rosario/annotations.json
+checkpoint_dir: /home/vllsmn02h03b202i/rosario/checkpoints_query_gt
+pretrained_compressor: ""      # optional path to a pretrained compressor ckpt
+recursive_tokens: false
+
+# device / runtime
+device: auto                   # cuda when available
+dtype: bf16                    # bf16 used only on cuda
+num_workers: 8
+seed: 42
+
+# token loading
+pool_to_fps: 1
+
+# GT window augmentation
+gt_max_left_pad: 30.0
+gt_max_right_pad: 30.0
+gt_window_zero_dur_pad: 5.0
+gt_exact_prob: 0.2
+
+# CLIP
+clip_model: openai/clip-vit-large-patch14
+max_question_len: 77
+
+# data
+context_strategy: full_until_query   # full_until_query | full_video | random_crop
+random_crop_extra_min: 16
+random_crop_extra_max: 256
+max_seq_len: 2048
+out_len: 32
+val_ratio: 0.1
+test_ratio: 0.1
+
+# model (embed_dim must equal the extracted token hidden size)
+embed_dim: 4096
+num_heads: 8
+num_queries: 16
+decoder_layers: 2
+dropout: 0.1
+memory_mode: z                 # z | z_m | h | h_z
+xlstm_num_blocks: 3
+xlstm_slstm_at: [1]
+freeze_compressor: false
+
+# optimization
+batch_size: 1
+gradient_accumulation_steps: 4
+epochs: 10
+learning_rate: 5.0e-5
+weight_decay: 1.0e-2
+grad_clip: 1.0
+
+# loss
+cosine_weight: 0.1
+infonce_weight: 0.0            # in-batch InfoNCE; needs batch_size > 1 to fire
+infonce_temperature: 0.07
+
+# logging
+use_wandb: true
+wandb_project: query-gt-token-reconstruction
+wandb_mode: offline            # online | offline | disabled
+
+# control flow
+dry_run: false
+resume: ""                     # path to last .pth to resume from
+
+# evaluation (used by src.evaluation.evaluate)
+eval_checkpoint: ""            # empty -> <checkpoint_dir>/query_gt_reconstructor_best.pth
+eval_split: test               # test | val
