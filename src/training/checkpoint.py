@@ -8,6 +8,7 @@ loads only the compressor sub-module from an arbitrary checkpoint.
 
 from __future__ import annotations
 
+import os
 from typing import Dict, Optional
 
 import torch
@@ -44,6 +45,7 @@ def save_best_checkpoint(
     config: dict,
 ) -> None:
     """Save the best-so-far model (weights + metadata)."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
             "epoch": epoch,
@@ -67,6 +69,7 @@ def save_last_checkpoint(
     config: dict,
 ) -> None:
     """Save the latest model plus optimizer / scheduler state for resuming."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
             "epoch": epoch,

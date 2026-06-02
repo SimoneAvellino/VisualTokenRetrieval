@@ -50,7 +50,7 @@ from .checkpoint import (
     set_compressor_trainable,
     unwrap_state_dict,
 )
-from .losses import reconstruction_loss
+from .losses import ReconstructionLoss
 
 
 @dataclass
@@ -92,6 +92,10 @@ class TrainConfig:
     val_ratio: float = 0.1
     test_ratio: float = 0.1
 
+    # decode mode (Phase 2): "fixed" (out_len, time-warped) | "length_aware"
+    decode_mode: str = "fixed"
+    max_out_len: int = 64  # cap for length_aware decoding
+
     # model
     embed_dim: int = 4096
     num_heads: int = 8
@@ -102,6 +106,10 @@ class TrainConfig:
     xlstm_num_blocks: int = 3
     xlstm_slstm_at: Sequence[int] = field(default_factory=lambda: [1])
     freeze_compressor: bool = False
+    # compressor bottleneck (Phase 2): Perceiver resampler + multi-scale latents
+    use_perceiver: bool = False
+    perceiver_depth: int = 2
+    multiscale_strides: Sequence[int] = field(default_factory=lambda: [1])
 
     # optimization
     batch_size: int = 1
@@ -112,14 +120,29 @@ class TrainConfig:
     grad_clip: float = 1.0
 
     # loss
+    mse_weight: float = 1.0
     cosine_weight: float = 0.1
     infonce_weight: float = 0.0
     infonce_temperature: float = 0.07
+    # soft-DTW (Phase 1): shift-tolerant reconstruction term
+    softdtw_weight: float = 0.0
+    softdtw_gamma: float = 0.1
+    softdtw_dist: str = "cosine"  # cosine | l2
+    softdtw_normalize: bool = True
+    # temporal hard negatives (Phase 1): same-video shifted windows for InfoNCE
+    num_temporal_negatives: int = 0
+    temporal_neg_max_iou: float = 0.5
+    # length head (Phase 2, length_aware decode): weight on SmoothL1(len) term
+    length_weight: float = 0.0
+    # epochs to keep length_weight=0 before enabling it (0 = always active)
+    length_warmup_epochs: int = 0
 
     # logging
     use_wandb: bool = False
     wandb_project: str = "query-gt-token-reconstruction"
     wandb_mode: str = "offline"  # online | offline | disabled
+    # "loss" (lower=better) | "cos_seq" (higher=better)
+    checkpoint_metric: str = "loss"
 
     # control flow
     dry_run: bool = False
@@ -142,6 +165,10 @@ def _move(
         "question_ids": batch["question_ids"].to(device=device, non_blocking=True),  # type: ignore
         "question_mask": batch["question_mask"].to(device=device, non_blocking=True),  # type: ignore
         "target_tokens": batch["target_tokens"].to(device=device, dtype=dtype, non_blocking=True),  # type: ignore
+        "target_mask": batch["target_mask"].to(device=device, non_blocking=True),  # type: ignore
+        "target_len": batch["target_len"].to(device=device, non_blocking=True),  # type: ignore
+        "negatives": batch["negatives"].to(device=device, dtype=dtype, non_blocking=True),  # type: ignore
+        "negatives_mask": batch["negatives_mask"].to(device=device, non_blocking=True),  # type: ignore
         "metadata": batch["metadata"],
     }
 
@@ -149,6 +176,7 @@ def _move(
 def run_epoch(
     model: nn.Module,
     dataloader: DataLoader,
+    loss_fn: ReconstructionLoss,
     optimizer: Optional[torch.optim.Optimizer],
     scheduler: Optional[object],
     device: torch.device,
@@ -161,7 +189,7 @@ def run_epoch(
     """Run one train or eval epoch; return ``(avg_loss, avg_metrics, global_step)``."""
     model.train(train)
     tot_loss = 0.0
-    tot_met = {"mse": 0.0, "cos_token": 0.0, "cos_seq": 0.0, "cos_loss": 0.0, "info_nce": 0.0}
+    tot_met: Dict[str, float] = {}
     n = 0
     if train:
         assert optimizer is not None
@@ -173,18 +201,22 @@ def run_epoch(
             tqdm(dataloader, desc=f"{'Train' if train else 'Val'} {epoch}")
         ):
             b = _move(rb, device, dtype)
-            pred = model(
+            pred, aux = model(
                 b["context_tokens"],
                 b["context_mask"],
                 b["question_ids"],
                 b["question_mask"],
             )
-            loss, met = reconstruction_loss(
+            negs = b["negatives"] if b["negatives"].shape[1] > 0 else None
+            neg_mask = b["negatives_mask"] if negs is not None else None
+            loss, met = loss_fn(
                 pred,
                 b["target_tokens"],
-                cfg.cosine_weight,
-                cfg.infonce_weight,
-                cfg.infonce_temperature,
+                target_mask=b["target_mask"],
+                target_lengths=b["target_len"],
+                pred_len=aux.get("pred_len"),
+                negs=negs,
+                neg_mask=neg_mask,
             )
             dl = float(loss.detach().cpu())
             if train:
@@ -210,8 +242,8 @@ def run_epoch(
                             step=global_step,
                         )
             tot_loss += dl
-            for k in tot_met:
-                tot_met[k] += met[k]
+            for k, v in met.items():
+                tot_met[k] = tot_met.get(k, 0.0) + v
             n += 1
 
     avg = tot_loss / max(1, n)
@@ -271,6 +303,10 @@ def build_splits(
         max_seq_len=cfg.max_seq_len,
         random_crop_extra_min=cfg.random_crop_extra_min,
         random_crop_extra_max=cfg.random_crop_extra_max,
+        decode_mode=cfg.decode_mode,
+        max_out_len=cfg.max_out_len,
+        num_temporal_negatives=cfg.num_temporal_negatives,
+        temporal_neg_max_iou=cfg.temporal_neg_max_iou,
     )
 
     print("\nBuilding datasets...")
@@ -308,6 +344,11 @@ def build_model(cfg: TrainConfig) -> QueryConditionedGTReconstructor:
         slstm_at=list(cfg.xlstm_slstm_at),
         clip_model_name=cfg.clip_model,
         memory_mode=cfg.memory_mode,
+        decode_mode=cfg.decode_mode,
+        max_out_len=cfg.max_out_len,
+        use_perceiver=cfg.use_perceiver,
+        perceiver_depth=cfg.perceiver_depth,
+        multiscale_strides=list(cfg.multiscale_strides),
     )
 
 
@@ -345,12 +386,77 @@ def run(cfg: TrainConfig) -> None:
 
     if cfg.dry_run:
         b = next(iter(tr_ldr))
-        print("\nDRY RUN:")
-        print("  context_tokens :", tuple(b["context_tokens"].shape))
-        print("  target_tokens  :", tuple(b["target_tokens"].shape))
-        print("  window_names   :", [m["window_name"] for m in b["metadata"]])
-        print("  metadata[0]    :", b["metadata"][0])
+        print("\n=== DRY RUN ===")
+        print("[DATA — batch 0]")
+        print(f"  context_tokens : {tuple(b['context_tokens'].shape)}")
+        print(f"  context_mask   : {tuple(b['context_mask'].shape)}  valid_tokens={int(b['context_mask'][0].sum())}")
+        print(f"  target_tokens  : {tuple(b['target_tokens'].shape)}")
+        print(f"  target_mask    : {tuple(b['target_mask'].shape)}  valid_tokens={int(b['target_mask'][0].sum())}")
+        print(f"  target_len     : {b['target_len'].tolist()}")
+        print(f"  negatives      : {tuple(b['negatives'].shape)}  (B, K, L, D) — K={b['negatives'].shape[1]} negatives")
+        print(f"  negatives_mask : {tuple(b['negatives_mask'].shape)}")
+        print(f"  window_names   : {[m['window_name'] for m in b['metadata']]}")
+        print(f"  metadata[0]    : {b['metadata'][0]}")
+        print("\n[MODEL]")
+        _dry_loss_fn = ReconstructionLoss(
+            mse_weight=cfg.mse_weight,
+            cosine_weight=cfg.cosine_weight,
+            softdtw_weight=cfg.softdtw_weight,
+            infonce_weight=cfg.infonce_weight,
+            length_weight=cfg.length_weight,
+            infonce_temperature=cfg.infonce_temperature,
+            softdtw_gamma=cfg.softdtw_gamma,
+            softdtw_dist=cfg.softdtw_dist,
+            softdtw_normalize=cfg.softdtw_normalize,
+        )
+        _dry_model = build_model(cfg).to(device=device, dtype=dtype)
+        _dry_model.train()
+        print(f"  loss weights: mse={cfg.mse_weight} cos={cfg.cosine_weight} "
+              f"dtw={cfg.softdtw_weight} infonce={cfg.infonce_weight} "
+              f"length={cfg.length_weight}")
+        print(f"  memory_mode={cfg.memory_mode}  decode_mode={cfg.decode_mode}  "
+              f"use_perceiver={cfg.use_perceiver}")
+        print("\n[FORWARD — 2 batches]")
+        for _i, _rb in enumerate(tr_ldr):
+            if _i >= 2:
+                break
+            _b = _move(_rb, device, dtype)
+            _pred, _aux = _dry_model(
+                _b["context_tokens"], _b["context_mask"],
+                _b["question_ids"], _b["question_mask"],
+            )
+            _negs = _b["negatives"] if _b["negatives"].shape[1] > 0 else None
+            _neg_mask = _b["negatives_mask"] if _negs is not None else None
+            _loss, _info = _dry_loss_fn(
+                _pred, _b["target_tokens"],
+                target_mask=_b["target_mask"],
+                target_lengths=_b["target_len"],
+                pred_len=_aux.get("pred_len"),
+                negs=_negs,
+                neg_mask=_neg_mask,
+            )
+            _pred_len = _aux.get("pred_len")
+            print(f"  batch {_i}:")
+            print(f"    pred shape     : {tuple(_pred.shape)}")
+            print(f"    pred_len       : {[round(float(x.detach()), 2) for x in _pred_len] if _pred_len is not None else 'N/A'}  (true: {_b['target_len'].tolist()})")
+            print(f"    loss={float(_loss.detach()):.4f}  mse={_info['mse']:.4f}  "
+                  f"cos_token={_info['cos_token']:.4f}  cos_seq={_info['cos_seq']:.4f}")
+            print(f"    soft_dtw={_info['soft_dtw']:.4f}  info_nce={_info['info_nce']:.4f}  "
+                  f"length={_info['length']:.4f}")
+        print("\nDRY RUN OK")
         return
+
+    loss_fn = ReconstructionLoss(
+        mse_weight=cfg.mse_weight,
+        cosine_weight=cfg.cosine_weight,
+        softdtw_weight=cfg.softdtw_weight,
+        infonce_weight=cfg.infonce_weight,
+        length_weight=cfg.length_weight,
+        infonce_temperature=cfg.infonce_temperature,
+        softdtw_gamma=cfg.softdtw_gamma,
+        softdtw_dist=cfg.softdtw_dist,
+        softdtw_normalize=cfg.softdtw_normalize,
+    )
 
     model = build_model(cfg)
     if cfg.pretrained_compressor:
@@ -399,7 +505,7 @@ def run(cfg: TrainConfig) -> None:
         os.environ.setdefault("WANDB_DIR", os.path.join(cfg.checkpoint_dir, "wandb_logs"))
         wandb.init(project=cfg.wandb_project, config=asdict(cfg))
 
-    best_val = float("inf")
+    best_val = float("inf") if cfg.checkpoint_metric == "loss" else float("-inf")
     gs = 0
     start_epoch = 1
     last_path = os.path.join(cfg.checkpoint_dir, "query_gt_reconstructor_last.pth")
@@ -432,7 +538,14 @@ def run(cfg: TrainConfig) -> None:
 
     config_dict = asdict(cfg)
     for epoch in range(start_epoch, cfg.epochs + 1):
-        tl, tm, gs = run_epoch(model, tr_ldr, opt, sch, device, dtype, cfg, epoch, True, gs)
+        # length warmup: keep length_weight=0 until warmup epochs are done
+        if cfg.length_warmup_epochs > 0:
+            active_lw = 0.0 if epoch <= cfg.length_warmup_epochs else cfg.length_weight
+            if loss_fn.length_weight != active_lw:
+                loss_fn.length_weight = active_lw
+                best_val = float("inf") if cfg.checkpoint_metric == "loss" else float("-inf")
+                print(f"  [warmup] length_weight -> {active_lw} (epoch {epoch}) | best_val reset")
+        tl, tm, gs = run_epoch(model, tr_ldr, loss_fn, opt, sch, device, dtype, cfg, epoch, True, gs)
         print(
             f"\nEpoch {epoch} train | loss={tl:.4f} mse={tm['mse']:.4f} "
             f"cos_token={tm['cos_token']:.4f} cos_seq={tm['cos_seq']:.4f}"
@@ -440,7 +553,7 @@ def run(cfg: TrainConfig) -> None:
 
         vl, vm = tl, tm
         if vl_ldr:
-            vl, vm, _ = run_epoch(model, vl_ldr, None, None, device, dtype, cfg, epoch, False, gs)
+            vl, vm, _ = run_epoch(model, vl_ldr, loss_fn, None, None, device, dtype, cfg, epoch, False, gs)
             print(
                 f"Epoch {epoch} val   | loss={vl:.4f} mse={vm['mse']:.4f} "
                 f"cos_token={vm['cos_token']:.4f} cos_seq={vm['cos_seq']:.4f}"
@@ -460,10 +573,12 @@ def run(cfg: TrainConfig) -> None:
                 step=gs,
             )
 
-        if vl < best_val:
-            best_val = vl
+        ckpt_score = vl if cfg.checkpoint_metric == "loss" else vm["cos_seq"]
+        is_best = ckpt_score < best_val if cfg.checkpoint_metric == "loss" else ckpt_score > best_val
+        if is_best:
+            best_val = ckpt_score
             save_best_checkpoint(best_path, model, epoch, gs, best_val, config_dict)
-            print(f"  Best saved: {best_path}  (val_loss={best_val:.4f})")
+            print(f"  Best saved: {best_path}  ({cfg.checkpoint_metric}={best_val:.4f})")
 
         save_last_checkpoint(last_path, model, opt, sch, epoch, gs, best_val, config_dict)
         print(f"  Last saved: {last_path}")
@@ -482,7 +597,7 @@ def run(cfg: TrainConfig) -> None:
                 for k, v in unwrap_state_dict(ckpt).items()
             }
             m.load_state_dict(state)
-        sl, sm, _ = run_epoch(model, ts_ldr, None, None, device, dtype, cfg, cfg.epochs, False, gs)
+        sl, sm, _ = run_epoch(model, ts_ldr, loss_fn, None, None, device, dtype, cfg, cfg.epochs, False, gs)
         print(
             f"\nTEST | loss={sl:.4f} mse={sm['mse']:.4f} "
             f"cos_token={sm['cos_token']:.4f} cos_seq={sm['cos_seq']:.4f}"

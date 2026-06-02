@@ -1,8 +1,21 @@
 """Supervised dataset + collate for query-conditioned GT token reconstruction.
 
 Each item yields a context token sequence, a question string, and the target GT
-tokens (resampled to a fixed length). Training uses :class:`GTWindowSampler`
-augmentation; validation passes ``gt_sampler=None`` for exact GT windows.
+tokens. Two target regimes are supported:
+
+    - ``decode_mode="fixed"`` (legacy): the GT window is resampled to exactly
+      ``out_len`` tokens (time-warped).
+    - ``decode_mode="length_aware"``: the GT keeps its native token count (only
+      down-sampled if it exceeds ``max_out_len``), so the target stays on the real
+      time grid. Collate pads variable-length targets and emits a mask + length.
+
+When ``num_temporal_negatives > 0`` (train only), each item also carries ``K``
+**temporal hard negatives**: windows from the *same video*, shifted off the GT
+span. Same scene/objects, wrong moment — these force the contrastive loss to learn
+the action boundary rather than merely the video identity.
+
+Training uses :class:`GTWindowSampler` augmentation; validation passes
+``gt_sampler=None`` for exact GT windows (and no negatives).
 """
 
 from __future__ import annotations
@@ -18,6 +31,13 @@ from transformers import CLIPTokenizer
 from .annotations import MomentAnnotation
 from .gt_window import GTWindowSampler
 from .token_index import TokenChunkIndex, resample_tokens
+
+
+def _temporal_iou(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    """Intersection-over-union of two ``(start, end)`` time spans."""
+    inter = max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
+    union = (a[1] - a[0]) + (b[1] - b[0]) - inter
+    return inter / union if union > 0 else 0.0
 
 
 class EgoTempoGTReconstructionDataset(Dataset):
@@ -40,6 +60,10 @@ class EgoTempoGTReconstructionDataset(Dataset):
         random_crop_extra_max: int,
         gt_sampler: Optional[GTWindowSampler] = None,
         skip_uncovered: bool = True,
+        decode_mode: str = "fixed",
+        max_out_len: int = 64,
+        num_temporal_negatives: int = 0,
+        temporal_neg_max_iou: float = 0.5,
     ) -> None:
         self.chunk_index = chunk_index
         self.out_len = out_len
@@ -49,6 +73,11 @@ class EgoTempoGTReconstructionDataset(Dataset):
         self.random_crop_extra_max = random_crop_extra_max
         # None = no augmentation (val mode): always use exact GT
         self.gt_sampler = gt_sampler
+        self.decode_mode = decode_mode
+        self.max_out_len = max_out_len
+        # negatives are a training-only signal (needs the augmentation sampler)
+        self.num_negs = num_temporal_negatives if gt_sampler is not None else 0
+        self.neg_max_iou = temporal_neg_max_iou
 
         valid: List[MomentAnnotation] = []
         skipped = 0
@@ -74,10 +103,26 @@ class EgoTempoGTReconstructionDataset(Dataset):
             if gt_sampler is not None
             else "exact GT (no augmentation)"
         )
-        print(f"Dataset: {len(valid)} annotations | {skipped} skipped | mode={mode}")
+        print(
+            f"Dataset: {len(valid)} annotations | {skipped} skipped | mode={mode} "
+            f"| decode={decode_mode} | negs={self.num_negs}"
+        )
 
     def __len__(self) -> int:
         return len(self.annotations)
+
+    def _resample_target(self, tok: torch.Tensor) -> torch.Tensor:
+        """Convert loaded GT tokens to the target tensor for the active decode mode.
+
+        ``fixed``        -> always ``out_len`` (time-warped).
+        ``length_aware`` -> native length, down-sampled only if it exceeds
+                            ``max_out_len`` (keeps the real time grid otherwise).
+        """
+        if self.decode_mode == "fixed":
+            return resample_tokens(tok, self.out_len)
+        if tok.shape[0] > self.max_out_len:
+            return resample_tokens(tok, self.max_out_len)
+        return tok.float()
 
     def _get_ann_window(self, idx: int) -> Tuple[MomentAnnotation, float, float, str]:
         ann = self.annotations[idx]
@@ -91,6 +136,38 @@ class EgoTempoGTReconstructionDataset(Dataset):
             ann.gt_start, ann.gt_end, video_end=ann.query_time
         )
         return ann, ws, we, name
+
+    def _sample_temporal_negatives(
+        self, ann: MomentAnnotation, ws: float, we: float
+    ) -> List[torch.Tensor]:
+        """Sample up to ``num_negs`` same-video windows shifted off the GT span.
+
+        Shifts are multiples of the window duration in both directions. A
+        candidate is rejected if it falls outside the video, has no tokens on
+        disk, or overlaps the GT moment above ``neg_max_iou`` (too easy / too
+        similar to the positive).
+        """
+        dur = max(1.0, we - ws)
+        gt_span = (ann.gt_start, ann.gt_end if ann.gt_end > ann.gt_start else ann.gt_start + 1.0)
+        shifts = [-2.0, -1.5, -1.0, 1.0, 1.5, 2.0]
+        random.shuffle(shifts)
+        negs: List[torch.Tensor] = []
+        for s in shifts:
+            if len(negs) >= self.num_negs:
+                break
+            ns = ws + s * dur
+            ne = ns + dur
+            if ns < 0:
+                continue
+            if ann.query_time is not None and ne > ann.query_time:
+                continue
+            if _temporal_iou((ns, ne), gt_span) > self.neg_max_iou:
+                continue
+            tok, _ = self.chunk_index.load_range(ann.video_id, ns, ne)
+            if tok.numel() == 0:
+                continue
+            negs.append(self._resample_target(tok))
+        return negs
 
     def _context_range(
         self, ann: MomentAnnotation
@@ -145,7 +222,10 @@ class EgoTempoGTReconstructionDataset(Dataset):
                 raise RuntimeError(
                     f"Empty GT: video={ann.video_id} win=({ws:.1f},{we:.1f})"
                 )
-            target = resample_tokens(gt_tok, self.out_len)
+            target = self._resample_target(gt_tok)
+            negs = (
+                self._sample_temporal_negatives(ann, ws, we) if self.num_negs > 0 else []
+            )
 
             cs, ce = self._context_range(ann)
             ctx, ctx_t = self.chunk_index.load_range(ann.video_id, cs, ce)
@@ -163,6 +243,8 @@ class EgoTempoGTReconstructionDataset(Dataset):
             "context_tokens": ctx,
             "question": ann.question,
             "target_tokens": target,
+            "target_len": int(target.shape[0]),
+            "negatives": negs,
             "metadata": {
                 "video_id": ann.video_id,
                 "question": ann.question,
@@ -178,19 +260,47 @@ class EgoTempoGTReconstructionDataset(Dataset):
         }
 
 
+def _pad_seq_batch(
+    seqs: Sequence[torch.Tensor], dim: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Right-pad a list of ``[T_i, dim]`` tensors to ``[B, Tmax, dim]``.
+
+    Returns ``(padded, mask [B, Tmax] bool, lengths [B] long)``.
+    """
+    lengths = torch.tensor([s.shape[0] for s in seqs], dtype=torch.long)
+    Tmax = int(lengths.max())
+    out = torch.zeros(len(seqs), Tmax, dim)
+    mask = torch.zeros(len(seqs), Tmax, dtype=torch.bool)
+    for i, s in enumerate(seqs):
+        out[i, : s.shape[0]] = s
+        mask[i, : s.shape[0]] = True
+    return out, mask, lengths
+
+
 def build_collate_fn(tokenizer: CLIPTokenizer, max_question_len: int = 77):
-    """Build a collate fn that pads context tokens and tokenizes questions."""
+    """Build a collate fn that pads context tokens, targets, negatives, and tokenizes questions.
+
+    Targets are padded to the batch-max length (``target_mask`` / ``target_len``
+    mark the real tokens). Negatives are padded over both the per-sample count
+    ``K`` and the time axis, producing ``negatives [B, Kmax, Lmax, D]`` with
+    ``negatives_mask [B, Kmax, Lmax]``. ``negatives`` is an empty tensor when no
+    negatives were sampled.
+    """
 
     def collate(batch: Sequence[Dict[str, object]]) -> Dict[str, object]:
-        lengths = [item["context_tokens"].shape[0] for item in batch]  # type: ignore
-        ML = max(lengths)
         dim = batch[0]["context_tokens"].shape[1]  # type: ignore
-        ctx = torch.zeros(len(batch), ML, dim)
-        cmsk = torch.zeros(len(batch), ML, dtype=torch.bool)
-        for i, item in enumerate(batch):
-            x = item["context_tokens"]  # type: ignore
-            ctx[i, : x.shape[0]] = x
-            cmsk[i, : x.shape[0]] = True
+
+        # context
+        ctx, cmsk, _ = _pad_seq_batch(
+            [item["context_tokens"] for item in batch], dim  # type: ignore
+        )
+
+        # targets (variable length in length_aware mode)
+        tgt, tmsk, tlen = _pad_seq_batch(
+            [item["target_tokens"] for item in batch], dim  # type: ignore
+        )
+
+        # questions
         enc = tokenizer(
             [item["question"] for item in batch],  # type: ignore
             padding="max_length",
@@ -198,12 +308,33 @@ def build_collate_fn(tokenizer: CLIPTokenizer, max_question_len: int = 77):
             max_length=max_question_len,
             return_tensors="pt",
         )
+
+        # temporal negatives: pad over K (count) and L (time)
+        neg_lists = [item["negatives"] for item in batch]  # type: ignore
+        Kmax = max((len(n) for n in neg_lists), default=0)
+        if Kmax > 0:
+            Lmax = max(t.shape[0] for negs in neg_lists for t in negs)
+            B = len(batch)
+            negatives = torch.zeros(B, Kmax, Lmax, dim)
+            neg_mask = torch.zeros(B, Kmax, Lmax, dtype=torch.bool)
+            for i, negs in enumerate(neg_lists):
+                for k, t in enumerate(negs):
+                    negatives[i, k, : t.shape[0]] = t
+                    neg_mask[i, k, : t.shape[0]] = True
+        else:
+            negatives = torch.zeros(len(batch), 0, 0, dim)
+            neg_mask = torch.zeros(len(batch), 0, 0, dtype=torch.bool)
+
         return {
             "context_tokens": ctx,
             "context_mask": cmsk,
             "question_ids": enc["input_ids"],
             "question_mask": enc["attention_mask"].bool(),
-            "target_tokens": torch.stack([item["target_tokens"] for item in batch]),  # type: ignore
+            "target_tokens": tgt,
+            "target_mask": tmsk,
+            "target_len": tlen,
+            "negatives": negatives,
+            "negatives_mask": neg_mask,
             "metadata": [item["metadata"] for item in batch],
         }
 

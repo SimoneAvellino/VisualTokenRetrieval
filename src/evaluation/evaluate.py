@@ -44,23 +44,30 @@ def evaluate(model, loader, device, dtype) -> Dict[str, float]:
     n = 0
     for rb in tqdm(loader, desc="eval", leave=False):
         b = _move(rb, device, dtype)
-        pred = model(
+        pred, _ = model(
             b["context_tokens"],
             b["context_mask"],
             b["question_ids"],
             b["question_mask"],
-        ).float()
-        target = b["target_tokens"].float()
-        agg["mse"] += float(F.mse_loss(pred, target).cpu())
-        agg["cos_token"] += float(
-            F.cosine_similarity(
-                pred.reshape(-1, pred.shape[-1]),
-                target.reshape(-1, target.shape[-1]),
-                dim=-1,
-            ).mean().cpu()
         )
+        pred = pred.float()
+        target = b["target_tokens"].float()
+        if pred.shape[1] > target.shape[1]:  # length_aware: align time axis
+            pred = pred[:, : target.shape[1]]
+        mask = b["target_mask"]  # [B, L] — score only real tokens
+        m = mask.unsqueeze(-1).float()
+        agg["mse"] += float(
+            ((((pred - target) ** 2) * m).sum() / m.sum().clamp_min(1e-6) / pred.shape[-1]).cpu()
+        )
+        cs = F.cosine_similarity(pred, target, dim=-1)  # [B, L]
+        agg["cos_token"] += float(
+            ((cs * mask.float()).sum() / mask.float().sum().clamp_min(1e-6)).cpu()
+        )
+        pm = mask.unsqueeze(-1).to(pred.dtype)
+        p_mean = (pred * pm).sum(1) / pm.sum(1).clamp_min(1e-6)
+        t_mean = (target * pm).sum(1) / pm.sum(1).clamp_min(1e-6)
         agg["cos_seq"] += float(
-            F.cosine_similarity(pred.mean(1), target.mean(1), dim=-1).mean().cpu()
+            F.cosine_similarity(p_mean, t_mean, dim=-1).mean().cpu()
         )
         n += 1
     return {k: v / max(1, n) for k, v in agg.items()}

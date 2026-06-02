@@ -37,16 +37,24 @@ out_len: 32
 val_ratio: 0.2
 test_ratio: 0.2
 
+# decode mode (Phase 2)
+decode_mode: length_aware      # fixed | length_aware
+max_out_len: 48
+
 # model (embed_dim must equal the extracted token hidden size)
 embed_dim: 4096
 num_heads: 8
-num_queries: 16
+num_queries: 32                # = #latents when use_perceiver
 decoder_layers: 2
 dropout: 0.1
 memory_mode: z
 xlstm_num_blocks: 2
 xlstm_slstm_at: [1]
 freeze_compressor: false
+# compressor bottleneck (Phase 2)
+use_perceiver: true
+perceiver_depth: 2
+multiscale_strides: [1, 4]
 
 # optimization
 batch_size: 1
@@ -57,9 +65,17 @@ weight_decay: 1.0e-2
 grad_clip: 1.0
 
 # loss
+mse_weight: 0.1
 cosine_weight: 0.1
-infonce_weight: 0.0
+infonce_weight: 0.5            # temporal hard-negative InfoNCE
 infonce_temperature: 0.07
+softdtw_weight: 1.0           # shift-tolerant main term
+softdtw_gamma: 0.1
+softdtw_dist: cosine
+softdtw_normalize: true
+num_temporal_negatives: 2
+temporal_neg_max_iou: 0.5
+length_weight: 0.1
 
 # logging
 use_wandb: false

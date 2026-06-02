@@ -6,12 +6,12 @@
 tokens_dir: /home/vllsmn02h03b202i/rosario/visual_tokens/Ego4D
 annotations: /home/vllsmn02h03b202i/rosario/annotations.json
 checkpoint_dir: /home/vllsmn02h03b202i/rosario/checkpoints_query_gt
-pretrained_compressor: ""      # optional path to a pretrained compressor ckpt
+pretrained_compressor: "" # optional path to a pretrained compressor ckpt
 recursive_tokens: false
 
 # device / runtime
-device: auto                   # cuda when available
-dtype: bf16                    # bf16 used only on cuda
+device: auto # cuda when available
+dtype: bf16 # bf16 used only on cuda
 num_workers: 8
 seed: 42
 
@@ -29,7 +29,7 @@ clip_model: openai/clip-vit-large-patch14
 max_question_len: 77
 
 # data
-context_strategy: full_until_query   # full_until_query | full_video | random_crop
+context_strategy: full_until_query # full_until_query | full_video | random_crop
 random_crop_extra_min: 16
 random_crop_extra_max: 256
 max_seq_len: 2048
@@ -37,39 +37,59 @@ out_len: 32
 val_ratio: 0.1
 test_ratio: 0.1
 
+# decode mode (Phase 2)
+decode_mode: length_aware # fixed | length_aware (native time grid, no warp)
+max_out_len: 64 # cap on emitted tokens in length_aware mode
+
 # model (embed_dim must equal the extracted token hidden size)
 embed_dim: 4096
 num_heads: 8
-num_queries: 16
+num_queries: 64 # = #latents when use_perceiver (was 16)
 decoder_layers: 2
 dropout: 0.1
-memory_mode: z                 # z | z_m | h | h_z
+memory_mode: z # z | z_m | h | h_z
 xlstm_num_blocks: 3
 xlstm_slstm_at: [1]
 freeze_compressor: false
+# compressor bottleneck (Phase 2): Perceiver resampler + multi-scale latents
+use_perceiver: true
+perceiver_depth: 2
+multiscale_strides: [1, 4, 16] # fast action (1) + mid (4) + global context (16)
 
 # optimization
 batch_size: 1
 gradient_accumulation_steps: 4
-epochs: 10
+epochs: 40
 learning_rate: 5.0e-5
 weight_decay: 1.0e-2
 grad_clip: 1.0
 
 # loss
+mse_weight: 0.1 # weak magnitude anchor (soft-DTW is the main term)
 cosine_weight: 0.1
-infonce_weight: 0.0            # in-batch InfoNCE; needs batch_size > 1 to fire
+infonce_weight: 0.5 # temporal hard-negative InfoNCE (fires at any batch size)
 infonce_temperature: 0.07
+# soft-DTW (Phase 1): shift-tolerant reconstruction; main term
+softdtw_weight: 1.0
+softdtw_gamma: 0.1
+softdtw_dist: cosine # cosine | l2
+softdtw_normalize: true
+# temporal hard negatives (Phase 1): same-video shifted windows
+num_temporal_negatives: 4
+temporal_neg_max_iou: 0.5
+# length head (Phase 2): SmoothL1 on predicted token count (length_aware only)
+length_weight: 0.1
+length_warmup_epochs: 3 # keep length_weight=0 for first 3 epochs
 
 # logging
 use_wandb: true
 wandb_project: query-gt-token-reconstruction
-wandb_mode: offline            # online | offline | disabled
+wandb_mode: offline # online | offline | disabled
 
 # control flow
 dry_run: false
-resume: ""                     # path to last .pth to resume from
+resume: "" # path to last .pth to resume from
 
 # evaluation (used by src.evaluation.evaluate)
-eval_checkpoint: ""            # empty -> <checkpoint_dir>/query_gt_reconstructor_best.pth
-eval_split: test               # test | val
+eval_checkpoint: "" # empty -> <checkpoint_dir>/query_gt_reconstructor_best.pth
+eval_split: test # test | val
