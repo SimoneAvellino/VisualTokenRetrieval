@@ -89,11 +89,25 @@ def temporal_infonce(
     return F.cross_entropy(logits, tgt)
 
 
-class ReconstructionLoss(nn.Module):
-    """Combined reconstruction loss (MSE + cosine + soft-DTW + temporal InfoNCE).
+def _masked_norm_loss(
+    pred: torch.Tensor, target: torch.Tensor, mask: Optional[torch.Tensor]
+) -> torch.Tensor:
+    """SmoothL1 on per-token L2 norm difference — fixes scale collapse."""
+    pred_n = pred.norm(dim=-1)    # [B, T]
+    gt_n = target.norm(dim=-1)    # [B, T]
+    diff = F.smooth_l1_loss(pred_n, gt_n, reduction="none")  # [B, T]
+    if mask is None:
+        return diff.mean()
+    m = mask.to(diff.dtype)
+    return (diff * m).sum() / m.sum().clamp_min(1e-6)
 
-    ``loss = mse_weight * MSE
+
+class ReconstructionLoss(nn.Module):
+    """Combined reconstruction loss (MSE + cosine + norm + soft-DTW + temporal InfoNCE).
+
+    ``loss = mse_weight    * MSE
            + cosine_weight * (1 - cos_sim_token)
+           + norm_weight   * SmoothL1(||pred_t|| - ||gt_t||)
            + softdtw_weight * soft_dtw(pred, target)
            + infonce_weight * temporal_infonce(pred, target, negs)
            + length_weight  * SmoothL1(pred_len, target_len)``
@@ -101,12 +115,15 @@ class ReconstructionLoss(nn.Module):
     Terms with zero weight (or missing inputs) are skipped. ``softdtw_weight`` and
     ``infonce_weight`` (with hard negatives) are the Phase-1 levers; set them >0
     in the config to activate shift-tolerance and boundary-aware contrast.
+    ``norm_weight`` fixes scale collapse: predictions learning direction (cosine)
+    but landing in a deflated region of the embedding space.
     """
 
     def __init__(
         self,
         mse_weight: float = 1.0,
         cosine_weight: float = 0.1,
+        norm_weight: float = 0.0,
         softdtw_weight: float = 0.0,
         infonce_weight: float = 0.0,
         length_weight: float = 0.0,
@@ -118,6 +135,7 @@ class ReconstructionLoss(nn.Module):
         super().__init__()
         self.mse_weight = mse_weight
         self.cosine_weight = cosine_weight
+        self.norm_weight = norm_weight
         self.softdtw_weight = softdtw_weight
         self.infonce_weight = infonce_weight
         self.length_weight = length_weight
@@ -148,6 +166,11 @@ class ReconstructionLoss(nn.Module):
         cos_loss = 1.0 - cos_tok
         loss = self.mse_weight * mse + self.cosine_weight * cos_loss
 
+        norm_loss = pred.new_tensor(0.0)
+        if self.norm_weight > 0:
+            norm_loss = _masked_norm_loss(pred, target, target_mask)
+            loss = loss + self.norm_weight * norm_loss
+
         dtw = pred.new_tensor(0.0)
         if self.sdtw is not None:
             dtw = self.sdtw(pred, target, target_lengths, target_lengths).mean()
@@ -172,12 +195,23 @@ class ReconstructionLoss(nn.Module):
                 _masked_mean_time(target, target_mask),
                 dim=-1,
             ).mean()
+            # per-token norm ratio ||pred|| / ||gt|| — diagnoses scale collapse.
+            pn = pred.norm(dim=-1)
+            gn = target.norm(dim=-1).clamp_min(1e-6)
+            ratio = pn / gn
+            if target_mask is None:
+                norm_ratio = ratio.mean()
+            else:
+                rm = target_mask.to(ratio.dtype)
+                norm_ratio = (ratio * rm).sum() / rm.sum().clamp_min(1e-6)
 
         return loss, {
             "mse": float(mse.detach()),
             "cos_token": float(cos_tok.detach()),
             "cos_seq": float(seq_cos.detach()),
             "cos_loss": float(cos_loss.detach()),
+            "norm": float(norm_loss.detach()),
+            "norm_ratio": float(norm_ratio.detach()),
             "soft_dtw": float(dtw.detach()),
             "info_nce": float(info_nce.detach()),
             "length": float(length.detach()),

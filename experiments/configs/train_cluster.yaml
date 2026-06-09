@@ -65,15 +65,16 @@ weight_decay: 1.0e-2
 grad_clip: 1.0
 
 # loss
-mse_weight: 0.1 # weak magnitude anchor (soft-DTW is the main term)
+mse_weight: 0.5 # raised from 0.1 — anchor magnitude (fixes scale collapse)
 cosine_weight: 0.1
+norm_weight: 0.05 # per-token norm matching — corrects deflated prediction space
 infonce_weight: 0.5 # temporal hard-negative InfoNCE (fires at any batch size)
 infonce_temperature: 0.07
 # soft-DTW (Phase 1): shift-tolerant reconstruction; main term
 softdtw_weight: 1.0
 softdtw_gamma: 0.1
 softdtw_dist: cosine # cosine | l2
-softdtw_normalize: true
+softdtw_normalize: false
 # temporal hard negatives (Phase 1): same-video shifted windows
 num_temporal_negatives: 4
 temporal_neg_max_iou: 0.5
@@ -81,10 +82,9 @@ temporal_neg_max_iou: 0.5
 length_weight: 0.1
 length_warmup_epochs: 3 # keep length_weight=0 for first 3 epochs
 
-# logging
-use_wandb: true
-wandb_project: query-gt-token-reconstruction
-wandb_mode: offline # online | offline | disabled
+# checkpoint selection + early stopping
+checkpoint_metric: loss      # loss (lower=better) | cos_seq (higher=better)
+early_stopping_patience: 5   # stop after N epochs without val improvement (0=off)
 
 # control flow
 dry_run: false

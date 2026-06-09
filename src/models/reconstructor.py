@@ -56,6 +56,7 @@ class QueryConditionedGTReconstructor(nn.Module):
         use_perceiver: bool = False,
         perceiver_depth: int = 2,
         multiscale_strides: Sequence[int] = (1,),
+        model_dim: int = 0,
     ) -> None:
         super().__init__()
         assert memory_mode in {"z", "z_m", "h", "h_z"}
@@ -67,8 +68,18 @@ class QueryConditionedGTReconstructor(nn.Module):
         # number of decoder output slots: fixed -> out_len; length_aware -> cap
         self.num_slots = out_len if decode_mode == "fixed" else max_out_len
 
+        # Internal working dimension. ``model_dim<=0`` (or == embed_dim) keeps the
+        # original behaviour exactly: in/out projections become Identity, so the
+        # whole core runs at embed_dim. A smaller ``model_dim`` adds linear in/out
+        # projections and runs every submodule at the smaller dim, which is where
+        # the parameter count lives (matrices scale with dim^2).
+        d = embed_dim if model_dim <= 0 else model_dim
+        self.model_dim = d
+        self.in_proj = nn.Identity() if d == embed_dim else nn.Linear(embed_dim, d)
+        self.out_proj = nn.Identity() if d == embed_dim else nn.Linear(d, embed_dim)
+
         self.compressor = TokenCompressor(
-            embed_dim,
+            d,
             num_queries,
             num_heads,
             max_seq_len,
@@ -78,33 +89,33 @@ class QueryConditionedGTReconstructor(nn.Module):
             perceiver_depth=perceiver_depth,
             multiscale_strides=multiscale_strides,
         )
-        self.text_encoder = CLIPTextEncoder(embed_dim, clip_model_name)
+        self.text_encoder = CLIPTextEncoder(d, clip_model_name)
         self.q2mem = nn.MultiheadAttention(
-            embed_dim, num_heads, dropout=dropout, batch_first=True
+            d, num_heads, dropout=dropout, batch_first=True
         )
-        self.q2mem_ln = nn.LayerNorm(embed_dim)
-        self.out_queries = nn.Parameter(torch.randn(self.num_slots, embed_dim) * 0.02)
-        self.out_pos = nn.Parameter(torch.randn(self.num_slots, embed_dim) * 0.02)
+        self.q2mem_ln = nn.LayerNorm(d)
+        self.out_queries = nn.Parameter(torch.randn(self.num_slots, d) * 0.02)
+        self.out_pos = nn.Parameter(torch.randn(self.num_slots, d) * 0.02)
         self.q_summary_proj = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.LayerNorm(embed_dim)
+            nn.Linear(d, d), nn.GELU(), nn.LayerNorm(d)
         )
         dec_layer = nn.TransformerDecoderLayer(
-            embed_dim,
+            d,
             num_heads,
-            embed_dim * 2,
+            d * 2,
             dropout,
             batch_first=True,
             norm_first=True,
             activation="gelu",
         )
         self.decoder = nn.TransformerDecoder(
-            dec_layer, decoder_layers, norm=nn.LayerNorm(embed_dim)
+            dec_layer, decoder_layers, norm=nn.LayerNorm(d)
         )
-        self.out_ln = nn.LayerNorm(embed_dim)
+        self.out_ln = nn.LayerNorm(d)
         # length head: regresses the (positive) true token count from a pooled
         # decoder summary. softplus keeps the prediction >= 0.
         self.length_head = (
-            nn.Sequential(nn.Linear(embed_dim, embed_dim), nn.GELU(), nn.Linear(embed_dim, 1))
+            nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
             if decode_mode == "length_aware"
             else None
         )
@@ -141,6 +152,8 @@ class QueryConditionedGTReconstructor(nn.Module):
         question_mask: torch.Tensor,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         need_h = self.memory_mode in {"h", "h_z"}
+        # project tokens to the internal working dim (Identity when model_dim==embed_dim)
+        video_tokens = self.in_proj(video_tokens)
         Z, M, H = self.compressor(video_tokens, mask=video_mask, return_h=need_h)
         Q = self.text_encoder(question_ids, question_mask)
         mem, mpad = self._select_memory(Z, M, H, video_mask)
@@ -159,6 +172,10 @@ class QueryConditionedGTReconstructor(nn.Module):
 
         aux: Dict[str, torch.Tensor] = {}
         if self.length_head is not None:
+            # length head runs at the internal dim, before projecting pred back out
             # softplus -> positive token-count prediction
             aux["pred_len"] = F.softplus(self.length_head(pred.mean(1)).squeeze(-1))
+
+        # project predictions back to embed_dim so the loss compares in token space
+        pred = self.out_proj(pred)
         return pred, aux

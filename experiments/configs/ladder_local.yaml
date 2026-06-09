@@ -1,0 +1,35 @@
+# Model ladder — LOCAL (Mac / CPU). Small scale, for development & dry runs.
+# Run:     python -m src.training.ladder --config experiments/configs/ladder_local.yaml
+# Dry run: dry_run is true here by default — flips on the tiny end-to-end pass.
+
+base_config: experiments/configs/train_local.yaml
+
+results_dir: ./experiments/results
+figures_dir: ./figures
+summary_name: ladder_summary.json
+
+eval_split: test
+early_stopping_patience: 2
+
+# on a laptop, default to the tiny validation pass
+dry_run: true
+dry_run_epochs: 1
+dry_run_max_batches: 2
+
+baselines:
+  - mean_token
+  - center_window
+
+steps:
+  - name: 02_mse_only
+    overrides: {mse_weight: 1.0, cosine_weight: 0.0, norm_weight: 0.0, softdtw_weight: 0.0, infonce_weight: 0.0, length_weight: 0.0, num_temporal_negatives: 0}
+  - name: 03_mse_cosine
+    overrides: {mse_weight: 1.0, cosine_weight: 0.1, norm_weight: 0.0, softdtw_weight: 0.0, infonce_weight: 0.0, length_weight: 0.0, num_temporal_negatives: 0}
+  - name: 04_norm
+    overrides: {mse_weight: 1.0, cosine_weight: 0.1, norm_weight: 0.05, softdtw_weight: 0.0, infonce_weight: 0.0, length_weight: 0.0, num_temporal_negatives: 0}
+  - name: 05_softdtw
+    overrides: {mse_weight: 0.5, cosine_weight: 0.1, norm_weight: 0.05, softdtw_weight: 1.0, infonce_weight: 0.0, length_weight: 0.0, num_temporal_negatives: 0}
+  - name: 06_infonce_full
+    overrides: {mse_weight: 0.5, cosine_weight: 0.1, norm_weight: 0.05, softdtw_weight: 1.0, infonce_weight: 0.5, length_weight: 0.0, num_temporal_negatives: 4}
+  - name: 07_small_full
+    overrides: {model_dim: 1024, xlstm_num_blocks: 1, xlstm_slstm_at: [0], num_queries: 16, decoder_layers: 1, mse_weight: 0.5, cosine_weight: 0.1, norm_weight: 0.05, softdtw_weight: 1.0, infonce_weight: 0.5, length_weight: 0.0, num_temporal_negatives: 4}

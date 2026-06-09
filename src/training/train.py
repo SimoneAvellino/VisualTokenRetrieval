@@ -27,11 +27,6 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-try:
-    import wandb
-except Exception:
-    wandb = None
-
 from ..datasets.annotations import read_annotations
 from ..datasets.gt_window import GTWindowSampler
 from ..datasets.reconstruction_dataset import (
@@ -110,6 +105,9 @@ class TrainConfig:
     use_perceiver: bool = False
     perceiver_depth: int = 2
     multiscale_strides: Sequence[int] = field(default_factory=lambda: [1])
+    # internal working dimension (0 = use embed_dim, i.e. full-size model). A
+    # smaller value (e.g. 1024) adds in/out projections and shrinks the model.
+    model_dim: int = 0
 
     # optimization
     batch_size: int = 1
@@ -122,6 +120,7 @@ class TrainConfig:
     # loss
     mse_weight: float = 1.0
     cosine_weight: float = 0.1
+    norm_weight: float = 0.0      # per-token norm matching (fixes scale collapse)
     infonce_weight: float = 0.0
     infonce_temperature: float = 0.07
     # soft-DTW (Phase 1): shift-tolerant reconstruction term
@@ -137,12 +136,20 @@ class TrainConfig:
     # epochs to keep length_weight=0 before enabling it (0 = always active)
     length_warmup_epochs: int = 0
 
-    # logging
-    use_wandb: bool = False
-    wandb_project: str = "query-gt-token-reconstruction"
-    wandb_mode: str = "offline"  # online | offline | disabled
-    # "loss" (lower=better) | "cos_seq" (higher=better)
+    # checkpoint selection: "loss" (lower=better) | "cos_seq" (higher=better)
     checkpoint_metric: str = "loss"
+
+    # early stopping: stop after this many epochs without val-metric improvement
+    # (0 disables). The best checkpoint is always kept, so nothing is lost.
+    early_stopping_patience: int = 0
+
+    # ladder integration
+    run_name: str = ""              # label used in logs / result registry
+    keep_checkpoints: bool = True   # ladder sets False to delete weights after test
+    loss_curve_path: str = ""       # if set, write the train/val loss curve here
+    pca_scatter_path: str = ""      # if set, write the pred-vs-GT PCA scatter here
+    max_train_batches: int = 0      # >0 caps train batches per epoch (dry-run)
+    max_eval_batches: int = 0       # >0 caps eval batches per epoch (dry-run)
 
     # control flow
     dry_run: bool = False
@@ -185,12 +192,18 @@ def run_epoch(
     epoch: int,
     train: bool,
     global_step: int,
+    step_log: Optional[list] = None,
 ) -> Tuple[float, Dict[str, float], int]:
-    """Run one train or eval epoch; return ``(avg_loss, avg_metrics, global_step)``."""
+    """Run one train or eval epoch; return ``(avg_loss, avg_metrics, global_step)``.
+
+    If ``step_log`` is provided (train only), each optimizer step appends
+    ``(global_step, loss)`` to it for the per-step loss curve.
+    """
     model.train(train)
     tot_loss = 0.0
     tot_met: Dict[str, float] = {}
     n = 0
+    max_batches = cfg.max_train_batches if train else cfg.max_eval_batches
     if train:
         assert optimizer is not None
         optimizer.zero_grad(set_to_none=True)
@@ -200,6 +213,8 @@ def run_epoch(
         for bi, rb in enumerate(
             tqdm(dataloader, desc=f"{'Train' if train else 'Val'} {epoch}")
         ):
+            if max_batches and bi >= max_batches:
+                break
             b = _move(rb, device, dtype)
             pred, aux = model(
                 b["context_tokens"],
@@ -230,17 +245,8 @@ def run_epoch(
                         scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     global_step += 1
-                    if wandb and cfg.use_wandb:
-                        wandb.log(
-                            {
-                                "train/loss_step": dl,
-                                "train/lr": optimizer.param_groups[0]["lr"],
-                                "train/mse": met["mse"],
-                                "train/cos_token": met["cos_token"],
-                                "train/cos_seq": met["cos_seq"],
-                            },
-                            step=global_step,
-                        )
+                    if step_log is not None:
+                        step_log.append((global_step, dl))
             tot_loss += dl
             for k, v in met.items():
                 tot_met[k] = tot_met.get(k, 0.0) + v
@@ -270,9 +276,12 @@ def build_splits(
     anns = read_annotations(cfg.annotations)
     print(f"  Loaded: {len(anns)}")
 
-    # video-level split (no leakage across splits)
+    # video-level split (no leakage across splits). Use a dedicated RNG seeded by
+    # cfg.seed so the split is identical for baselines and every model regardless
+    # of global RNG state or call order — otherwise the ladder would compare them
+    # on different test sets.
     all_video_ids = sorted(set(a.video_id for a in anns))
-    random.shuffle(all_video_ids)
+    random.Random(cfg.seed).shuffle(all_video_ids)
     n_total = len(all_video_ids)
     n_test = max(1, int(n_total * cfg.test_ratio))
     n_val = max(1, int(n_total * cfg.val_ratio))
@@ -349,10 +358,12 @@ def build_model(cfg: TrainConfig) -> QueryConditionedGTReconstructor:
         use_perceiver=cfg.use_perceiver,
         perceiver_depth=cfg.perceiver_depth,
         multiscale_strides=list(cfg.multiscale_strides),
+        model_dim=cfg.model_dim,
     )
 
 
-def run(cfg: TrainConfig) -> None:
+def run(cfg: TrainConfig) -> Optional[Dict[str, object]]:
+    """Train one model and return its result dict (None on dry-run)."""
     set_seed(cfg.seed)
     safe_makedirs(cfg.checkpoint_dir)
 
@@ -401,6 +412,7 @@ def run(cfg: TrainConfig) -> None:
         _dry_loss_fn = ReconstructionLoss(
             mse_weight=cfg.mse_weight,
             cosine_weight=cfg.cosine_weight,
+            norm_weight=cfg.norm_weight,
             softdtw_weight=cfg.softdtw_weight,
             infonce_weight=cfg.infonce_weight,
             length_weight=cfg.length_weight,
@@ -412,8 +424,8 @@ def run(cfg: TrainConfig) -> None:
         _dry_model = build_model(cfg).to(device=device, dtype=dtype)
         _dry_model.train()
         print(f"  loss weights: mse={cfg.mse_weight} cos={cfg.cosine_weight} "
-              f"dtw={cfg.softdtw_weight} infonce={cfg.infonce_weight} "
-              f"length={cfg.length_weight}")
+              f"norm={cfg.norm_weight} dtw={cfg.softdtw_weight} "
+              f"infonce={cfg.infonce_weight} length={cfg.length_weight}")
         print(f"  memory_mode={cfg.memory_mode}  decode_mode={cfg.decode_mode}  "
               f"use_perceiver={cfg.use_perceiver}")
         print("\n[FORWARD — 2 batches]")
@@ -440,7 +452,8 @@ def run(cfg: TrainConfig) -> None:
             print(f"    pred shape     : {tuple(_pred.shape)}")
             print(f"    pred_len       : {[round(float(x.detach()), 2) for x in _pred_len] if _pred_len is not None else 'N/A'}  (true: {_b['target_len'].tolist()})")
             print(f"    loss={float(_loss.detach()):.4f}  mse={_info['mse']:.4f}  "
-                  f"cos_token={_info['cos_token']:.4f}  cos_seq={_info['cos_seq']:.4f}")
+                  f"cos_token={_info['cos_token']:.4f}  cos_seq={_info['cos_seq']:.4f}  "
+                  f"norm={_info['norm']:.4f}")
             print(f"    soft_dtw={_info['soft_dtw']:.4f}  info_nce={_info['info_nce']:.4f}  "
                   f"length={_info['length']:.4f}")
         print("\nDRY RUN OK")
@@ -449,6 +462,7 @@ def run(cfg: TrainConfig) -> None:
     loss_fn = ReconstructionLoss(
         mse_weight=cfg.mse_weight,
         cosine_weight=cfg.cosine_weight,
+        norm_weight=cfg.norm_weight,
         softdtw_weight=cfg.softdtw_weight,
         infonce_weight=cfg.infonce_weight,
         length_weight=cfg.length_weight,
@@ -498,13 +512,6 @@ def run(cfg: TrainConfig) -> None:
         anneal_strategy="cos",
     )
 
-    if cfg.use_wandb:
-        if wandb is None:
-            raise RuntimeError("wandb not installed.")
-        os.environ["WANDB_MODE"] = cfg.wandb_mode
-        os.environ.setdefault("WANDB_DIR", os.path.join(cfg.checkpoint_dir, "wandb_logs"))
-        wandb.init(project=cfg.wandb_project, config=asdict(cfg))
-
     best_val = float("inf") if cfg.checkpoint_metric == "loss" else float("-inf")
     gs = 0
     start_epoch = 1
@@ -537,18 +544,32 @@ def run(cfg: TrainConfig) -> None:
     )
 
     config_dict = asdict(cfg)
+    run_name = cfg.run_name or "model"
+    # in-memory loss history (per-step train, per-epoch val) for the loss curve.
+    history: Dict[str, list] = {"train_steps": [], "val_epochs": []}
+    epochs_since_improve = 0
+    stopped_early = False
+    last_epoch = start_epoch - 1
     for epoch in range(start_epoch, cfg.epochs + 1):
+        last_epoch = epoch
         # length warmup: keep length_weight=0 until warmup epochs are done
         if cfg.length_warmup_epochs > 0:
             active_lw = 0.0 if epoch <= cfg.length_warmup_epochs else cfg.length_weight
             if loss_fn.length_weight != active_lw:
                 loss_fn.length_weight = active_lw
                 best_val = float("inf") if cfg.checkpoint_metric == "loss" else float("-inf")
+                epochs_since_improve = 0  # loss surface changed; restart patience
                 print(f"  [warmup] length_weight -> {active_lw} (epoch {epoch}) | best_val reset")
-        tl, tm, gs = run_epoch(model, tr_ldr, loss_fn, opt, sch, device, dtype, cfg, epoch, True, gs)
+        tl, tm, gs = run_epoch(
+            model, tr_ldr, loss_fn, opt, sch, device, dtype, cfg, epoch, True, gs,
+            step_log=history["train_steps"],
+        )
         print(
             f"\nEpoch {epoch} train | loss={tl:.4f} mse={tm['mse']:.4f} "
-            f"cos_token={tm['cos_token']:.4f} cos_seq={tm['cos_seq']:.4f}"
+            f"cos_token={tm['cos_token']:.4f} cos_seq={tm['cos_seq']:.4f}\n"
+            f"             terms | norm={tm['norm']:.4f} soft_dtw={tm['soft_dtw']:.4f} "
+            f"info_nce={tm['info_nce']:.4f} length={tm['length']:.4f} "
+            f"norm_ratio={tm['norm_ratio']:.4f}"
         )
 
         vl, vm = tl, tm
@@ -556,37 +577,42 @@ def run(cfg: TrainConfig) -> None:
             vl, vm, _ = run_epoch(model, vl_ldr, loss_fn, None, None, device, dtype, cfg, epoch, False, gs)
             print(
                 f"Epoch {epoch} val   | loss={vl:.4f} mse={vm['mse']:.4f} "
-                f"cos_token={vm['cos_token']:.4f} cos_seq={vm['cos_seq']:.4f}"
+                f"cos_token={vm['cos_token']:.4f} cos_seq={vm['cos_seq']:.4f}\n"
+                f"             terms | norm={vm['norm']:.4f} soft_dtw={vm['soft_dtw']:.4f} "
+                f"info_nce={vm['info_nce']:.4f} length={vm['length']:.4f} "
+                f"norm_ratio={vm['norm_ratio']:.4f}"
             )
-
-        if wandb and cfg.use_wandb:
-            wandb.log(
-                {
-                    "epoch": epoch,
-                    "train/loss": tl,
-                    "train/mse": tm["mse"],
-                    "train/cos_seq": tm["cos_seq"],
-                    "val/loss": vl,
-                    "val/mse": vm["mse"],
-                    "val/cos_seq": vm["cos_seq"],
-                },
-                step=gs,
-            )
+        history["val_epochs"].append((gs, vl))
 
         ckpt_score = vl if cfg.checkpoint_metric == "loss" else vm["cos_seq"]
         is_best = ckpt_score < best_val if cfg.checkpoint_metric == "loss" else ckpt_score > best_val
         if is_best:
             best_val = ckpt_score
+            epochs_since_improve = 0
             save_best_checkpoint(best_path, model, epoch, gs, best_val, config_dict)
             print(f"  Best saved: {best_path}  ({cfg.checkpoint_metric}={best_val:.4f})")
+        else:
+            epochs_since_improve += 1
 
         save_last_checkpoint(last_path, model, opt, sch, epoch, gs, best_val, config_dict)
         print(f"  Last saved: {last_path}")
 
-    # final test evaluation on the best checkpoint
-    if ts_ldr:
+        # early stopping: overfitting shows up as val metric no longer improving.
+        if cfg.early_stopping_patience > 0 and epochs_since_improve >= cfg.early_stopping_patience:
+            stopped_early = True
+            print(
+                f"\nEarly stopping at epoch {epoch}: no improvement for "
+                f"{epochs_since_improve} epochs (patience={cfg.early_stopping_patience})."
+            )
+            break
+
+    # final evaluation on the best checkpoint (test split if available, else val).
+    eval_ldr = ts_ldr or vl_ldr
+    eval_split = "test" if ts_ldr else "val"
+    final_metrics: Dict[str, float] = {}
+    if eval_ldr:
         if os.path.exists(best_path):
-            print(f"\nLoading best checkpoint for test: {best_path}")
+            print(f"\nLoading best checkpoint for {eval_split}: {best_path}")
             try:
                 ckpt = torch.load(best_path, map_location="cpu", weights_only=False)
             except Exception:
@@ -597,17 +623,75 @@ def run(cfg: TrainConfig) -> None:
                 for k, v in unwrap_state_dict(ckpt).items()
             }
             m.load_state_dict(state)
-        sl, sm, _ = run_epoch(model, ts_ldr, loss_fn, None, None, device, dtype, cfg, cfg.epochs, False, gs)
+        sl, sm, _ = run_epoch(model, eval_ldr, loss_fn, None, None, device, dtype, cfg, last_epoch, False, gs)
+        final_metrics = {
+            "loss": sl,
+            "mse": sm["mse"],
+            "cos_token": sm["cos_token"],
+            "cos_seq": sm["cos_seq"],
+            "norm_ratio": sm["norm_ratio"],
+        }
         print(
-            f"\nTEST | loss={sl:.4f} mse={sm['mse']:.4f} "
-            f"cos_token={sm['cos_token']:.4f} cos_seq={sm['cos_seq']:.4f}"
+            f"\n{eval_split.upper()} | loss={sl:.4f} mse={sm['mse']:.4f} "
+            f"cos_token={sm['cos_token']:.4f} cos_seq={sm['cos_seq']:.4f} "
+            f"norm_ratio={sm['norm_ratio']:.4f}"
         )
-        if wandb and cfg.use_wandb:
-            wandb.log({"test/loss": sl, "test/mse": sm["mse"], "test/cos_seq": sm["cos_seq"]}, step=gs)
 
-    if wandb and cfg.use_wandb:
-        wandb.finish()
-    print(f"\nDone. Best val loss: {best_val:.4f}")
+        # retrieval metrics + PCA scatter (cross-sample): does the model rank its
+        # own GT above other moments? cos_token saturates, this does not.
+        from ..evaluation.retrieval import collect_vectors, retrieval_scores
+
+        m_eval = model.module if isinstance(model, nn.DataParallel) else model
+        m_eval.eval()
+        pred_vecs, gt_vecs, _ = collect_vectors(
+            predict_fn=lambda b: m_eval(
+                b["context_tokens"], b["context_mask"],
+                b["question_ids"], b["question_mask"],
+            )[0],
+            move_fn=lambda rb: _move(rb, device, dtype),
+            loader=eval_ldr,
+            max_batches=cfg.max_eval_batches,
+        )
+        retr = retrieval_scores(pred_vecs, gt_vecs)
+        final_metrics.update({
+            "recall@1": retr["recall@1"],
+            "recall@5": retr["recall@5"],
+            "mrr": retr["mrr"],
+            "median_rank": retr["median_rank"],
+            "chance_r1": retr["chance_r1"],
+        })
+        print(
+            f"{eval_split.upper()} retrieval | recall@1={retr['recall@1']:.4f} "
+            f"recall@5={retr['recall@5']:.4f} mrr={retr['mrr']:.4f} "
+            f"median_rank={retr['median_rank']:.1f} (chance r@1={retr['chance_r1']:.4f})"
+        )
+        if cfg.pca_scatter_path:
+            from ..evaluation.plot_space import plot_pred_vs_gt
+
+            plot_pred_vs_gt(gt_vecs, pred_vecs, cfg.pca_scatter_path, run_name, seed=cfg.seed)
+
+    # render the loss curve image (numbers are not persisted, only the PNG).
+    if cfg.loss_curve_path:
+        from ..evaluation.plot_curves import plot_loss_curve
+
+        plot_loss_curve(history, cfg.loss_curve_path, run_name, stopped_early=stopped_early)
+
+    # the ladder does not need weights — only scores. Drop them to save disk.
+    if not cfg.keep_checkpoints:
+        for p in (best_path, last_path):
+            if os.path.exists(p):
+                os.remove(p)
+        print("Removed checkpoints (keep_checkpoints=False).")
+
+    print(f"\nDone. Best val {cfg.checkpoint_metric}: {best_val:.4f}")
+    return {
+        "name": run_name,
+        "kind": "model",
+        "split": eval_split,
+        "metrics": final_metrics,
+        "epochs_run": last_epoch,
+        "stopped_early": stopped_early,
+    }
 
 
 def main() -> None:
