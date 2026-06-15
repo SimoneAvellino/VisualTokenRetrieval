@@ -1,0 +1,99 @@
+# Training — CLUSTER — SIMPLIFIED mean-token model.
+# Stripped-down pipeline: video -> xLSTM -> last valid token; question -> raw CLIP
+# (no projection); cross-attention + Transformer Decoder with ONE learnable query
+# -> a single predicted vector, trained against the mean of the GT window tokens
+# with in-batch InfoNCE (+ cosine anchor). The single-vector output collapses the
+# video memory, so the batch can be large (which is what makes in-batch InfoNCE
+# work — it needs negatives from other samples in the same forward).
+#
+# Run via the ladder:  sh/train_simplyified.sh  ->  ladder_simplified_cluster.yaml
+
+# paths (edit to match the VM)
+tokens_dir: /home/vllsmn02h03b202i/rosario/visual_tokens/Ego4D
+annotations: /home/vllsmn02h03b202i/rosario/annotations.json
+checkpoint_dir: /home/vllsmn02h03b202i/rosario/checkpoints_mean
+pretrained_compressor: ""
+recursive_tokens: false
+
+# device / runtime
+device: auto                  # cuda when available
+dtype: bf16                   # bf16 used only on cuda
+num_workers: 8
+seed: 42
+
+# token loading
+pool_to_fps: 1
+
+# GT window augmentation
+gt_max_left_pad: 30.0
+gt_max_right_pad: 30.0
+gt_window_zero_dur_pad: 5.0
+gt_exact_prob: 0.2
+
+# CLIP (raw output is used directly; core dim = CLIP text hidden = 768)
+clip_model: openai/clip-vit-large-patch14
+max_question_len: 77
+
+# data
+context_strategy: full_until_query   # full_until_query | full_video | random_crop
+random_crop_extra_min: 16
+random_crop_extra_max: 256
+# GPU memory ~ batch_size * max_seq_len. The shard quota is 22.5 GB (see the
+# SBATCH --gres=shard line), NOT the full 48 GB. The model keeps only the LAST
+# xLSTM state, so very long contexts give diminishing returns (recency bias) and
+# 1024 already covers the GT region (kept by the crop). 8*1024 fits with margin.
+max_seq_len: 1024
+out_len: 32                   # ignored by the mean model (target is pooled)
+val_ratio: 0.1
+test_ratio: 0.1
+
+# target stays native length; the loss mean-pools it to a single vector
+decode_mode: length_aware
+max_out_len: 64
+
+# model — kept deliberately small to fight overfitting on the ~384-example train
+# set (single xLSTM block, one decoder layer, high dropout).
+model_type: mean              # <-- MeanReconstructor (simplified)
+embed_dim: 4096               # must equal the extracted token hidden size
+num_heads: 8
+num_queries: 8                # N fixed output query slots (pooled for the loss);
+                              # the query-conditioning + localization mechanism
+decoder_layers: 2             # depth for the query->video cross-attention
+dropout: 0.1                  # moderate — the decoder is the localizer, don't choke it
+xlstm_num_blocks: 1           # backbone was never the bottleneck; keep it small
+xlstm_slstm_at: [0]
+
+# optimization — single-vector output -> large batch fits; large batch -> more
+# in-batch negatives. Memory ~ batch_size * max_seq_len; keep their product within
+# the 22.5 GB shard quota (8 * 1024 leaves headroom). Raise as VRAM allows.
+batch_size: 14
+gradient_accumulation_steps: 1
+epochs: 40
+learning_rate: 3.0e-4
+weight_decay: 5.0e-2          # was 1e-2 — stronger weight decay against overfitting
+grad_clip: 1.0
+
+# loss — in-batch InfoNCE (retrieval objective) + small cosine anchor
+cosine_weight: 0.1
+batch_infonce_weight: 1.0
+batch_infonce_temperature: 0.07
+batch_infonce_symmetric: true
+num_temporal_negatives: 24   # same-video temporal hard negatives (now used by MeanInfoNCELoss)
+length_weight: 0.0
+length_warmup_epochs: 0
+
+# checkpoint selection + early stopping
+checkpoint_metric: loss       # loss (lower=better) | cos_seq (higher=better)
+early_stopping_patience: 3
+
+# query-usage ablation: also evaluate retrieval with shuffled queries (diagnoses
+# whether the model actually uses the question to localise the moment).
+ablation_shuffle_query: true
+
+# control flow
+dry_run: false
+resume: ""
+
+# evaluation (used by src.evaluation.evaluate)
+eval_checkpoint: ""
+eval_split: test

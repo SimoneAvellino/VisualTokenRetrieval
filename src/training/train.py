@@ -45,7 +45,7 @@ from .checkpoint import (
     set_compressor_trainable,
     unwrap_state_dict,
 )
-from .losses import ReconstructionLoss
+from .losses import MeanInfoNCELoss, ReconstructionLoss
 
 
 @dataclass
@@ -92,6 +92,9 @@ class TrainConfig:
     max_out_len: int = 64  # cap for length_aware decoding
 
     # model
+    # "query_gt"  -> QueryConditionedGTReconstructor (full sequence reconstruction)
+    # "mean"      -> MeanReconstructor (single pooled-vector prediction, simplified)
+    model_type: str = "query_gt"
     embed_dim: int = 4096
     num_heads: int = 8
     num_queries: int = 16
@@ -135,6 +138,14 @@ class TrainConfig:
     length_weight: float = 0.0
     # epochs to keep length_weight=0 before enabling it (0 = always active)
     length_warmup_epochs: int = 0
+    # span head: weight on the temporal-grounding loss (L1 + 1D IoU on the moment's
+    # start/end fractions). The direct localization signal.
+    span_weight: float = 0.0
+    # mean model (model_type="mean"): in-batch InfoNCE on pooled vectors + cosine
+    # anchor. InfoNCE needs batch_size > 1 to have negatives.
+    batch_infonce_weight: float = 1.0
+    batch_infonce_temperature: float = 0.07
+    batch_infonce_symmetric: bool = True
 
     # checkpoint selection: "loss" (lower=better) | "cos_seq" (higher=better)
     checkpoint_metric: str = "loss"
@@ -150,6 +161,9 @@ class TrainConfig:
     pca_scatter_path: str = ""      # if set, write the pred-vs-GT PCA scatter here
     max_train_batches: int = 0      # >0 caps train batches per epoch (dry-run)
     max_eval_batches: int = 0       # >0 caps eval batches per epoch (dry-run)
+    ablation_shuffle_query: bool = False  # also run retrieval with queries shuffled
+                                          # across samples — if recall barely drops,
+                                          # the model ignores the query.
 
     # control flow
     dry_run: bool = False
@@ -174,6 +188,7 @@ def _move(
         "target_tokens": batch["target_tokens"].to(device=device, dtype=dtype, non_blocking=True),  # type: ignore
         "target_mask": batch["target_mask"].to(device=device, non_blocking=True),  # type: ignore
         "target_len": batch["target_len"].to(device=device, non_blocking=True),  # type: ignore
+        "target_span": batch["target_span"].to(device=device, non_blocking=True),  # type: ignore  (keep float32)
         "negatives": batch["negatives"].to(device=device, dtype=dtype, non_blocking=True),  # type: ignore
         "negatives_mask": batch["negatives_mask"].to(device=device, non_blocking=True),  # type: ignore
         "metadata": batch["metadata"],
@@ -183,7 +198,7 @@ def _move(
 def run_epoch(
     model: nn.Module,
     dataloader: DataLoader,
-    loss_fn: ReconstructionLoss,
+    loss_fn: nn.Module,
     optimizer: Optional[torch.optim.Optimizer],
     scheduler: Optional[object],
     device: torch.device,
@@ -232,6 +247,8 @@ def run_epoch(
                 pred_len=aux.get("pred_len"),
                 negs=negs,
                 neg_mask=neg_mask,
+                target_span=b.get("target_span"),
+                pred_span=aux.get("pred_span"),
             )
             dl = float(loss.detach().cpu())
             if train:
@@ -339,8 +356,46 @@ def build_splits(
     return tr_ds, vl_ds, ts_ds, ci
 
 
-def build_model(cfg: TrainConfig) -> QueryConditionedGTReconstructor:
-    """Construct the reconstructor from the config."""
+def build_loss(cfg: TrainConfig) -> nn.Module:
+    """Construct the loss from the config (model_type selects which)."""
+    if cfg.model_type == "mean":
+        return MeanInfoNCELoss(
+            infonce_weight=cfg.batch_infonce_weight,
+            cosine_weight=cfg.cosine_weight,
+            temperature=cfg.batch_infonce_temperature,
+            symmetric=cfg.batch_infonce_symmetric,
+        )
+    return ReconstructionLoss(
+        mse_weight=cfg.mse_weight,
+        cosine_weight=cfg.cosine_weight,
+        norm_weight=cfg.norm_weight,
+        softdtw_weight=cfg.softdtw_weight,
+        infonce_weight=cfg.infonce_weight,
+        length_weight=cfg.length_weight,
+        span_weight=cfg.span_weight,
+        infonce_temperature=cfg.infonce_temperature,
+        softdtw_gamma=cfg.softdtw_gamma,
+        softdtw_dist=cfg.softdtw_dist,
+        softdtw_normalize=cfg.softdtw_normalize,
+    )
+
+
+def build_model(cfg: TrainConfig) -> nn.Module:
+    """Construct the reconstructor from the config (model_type selects which)."""
+    if cfg.model_type == "mean":
+        from ..models.mean_reconstructor import MeanReconstructor
+
+        return MeanReconstructor(
+            embed_dim=cfg.embed_dim,
+            num_heads=cfg.num_heads,
+            decoder_layers=cfg.decoder_layers,
+            dropout=cfg.dropout,
+            num_blocks=cfg.xlstm_num_blocks,
+            slstm_at=list(cfg.xlstm_slstm_at),
+            max_seq_len=cfg.max_seq_len,
+            num_queries=cfg.num_queries,
+            clip_model_name=cfg.clip_model,
+        )
     return QueryConditionedGTReconstructor(
         embed_dim=cfg.embed_dim,
         num_heads=cfg.num_heads,
@@ -359,6 +414,54 @@ def build_model(cfg: TrainConfig) -> QueryConditionedGTReconstructor:
         perceiver_depth=cfg.perceiver_depth,
         multiscale_strides=list(cfg.multiscale_strides),
         model_dim=cfg.model_dim,
+    )
+
+
+# metrics usable for checkpoint selection / early stopping (all higher=better).
+# cross-sample (cross-video) retrieval:
+_RETRIEVAL_CKPT_METRICS = ("recall@1", "recall@5", "mrr")
+# intra-video localization (the project goal: find the moment WITHIN the video):
+_LOCAL_CKPT_METRICS = ("intra_recall@1", "intra_mrr")
+
+
+def _model_predict_fn(model, device, dtype):
+    """A predict_fn (batch -> pred) bound to the unwrapped, eval-mode model."""
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    m.eval()
+    return m, (lambda b: m(
+        b["context_tokens"], b["context_mask"],
+        b["question_ids"], b["question_mask"],
+    )[0])
+
+
+@torch.no_grad()
+def _val_retrieval(model, loader, device, dtype, cfg) -> Dict[str, float]:
+    """Cross-sample (cross-video) retrieval scores on a loader."""
+    from ..evaluation.retrieval import collect_vectors, retrieval_scores
+
+    _, pred_fn = _model_predict_fn(model, device, dtype)
+    pv, gv, _ = collect_vectors(
+        predict_fn=pred_fn,
+        move_fn=lambda rb: _move(rb, device, dtype),
+        loader=loader,
+        max_batches=cfg.max_eval_batches,
+    )
+    return retrieval_scores(pv, gv)
+
+
+@torch.no_grad()
+def _val_localization(model, loader, device, dtype, cfg) -> Dict[str, float]:
+    """Intra-video localization scores (rank the GT moment among same-video
+    temporal negatives) — aligned with the goal of locating the moment in the
+    given video. Needs the loader to provide temporal negatives."""
+    from ..evaluation.retrieval import intra_video_scores
+
+    _, pred_fn = _model_predict_fn(model, device, dtype)
+    return intra_video_scores(
+        predict_fn=pred_fn,
+        move_fn=lambda rb: _move(rb, device, dtype),
+        loader=loader,
+        max_batches=cfg.max_eval_batches,
     )
 
 
@@ -409,18 +512,7 @@ def run(cfg: TrainConfig) -> Optional[Dict[str, object]]:
         print(f"  window_names   : {[m['window_name'] for m in b['metadata']]}")
         print(f"  metadata[0]    : {b['metadata'][0]}")
         print("\n[MODEL]")
-        _dry_loss_fn = ReconstructionLoss(
-            mse_weight=cfg.mse_weight,
-            cosine_weight=cfg.cosine_weight,
-            norm_weight=cfg.norm_weight,
-            softdtw_weight=cfg.softdtw_weight,
-            infonce_weight=cfg.infonce_weight,
-            length_weight=cfg.length_weight,
-            infonce_temperature=cfg.infonce_temperature,
-            softdtw_gamma=cfg.softdtw_gamma,
-            softdtw_dist=cfg.softdtw_dist,
-            softdtw_normalize=cfg.softdtw_normalize,
-        )
+        _dry_loss_fn = build_loss(cfg)
         _dry_model = build_model(cfg).to(device=device, dtype=dtype)
         _dry_model.train()
         print(f"  loss weights: mse={cfg.mse_weight} cos={cfg.cosine_weight} "
@@ -446,6 +538,8 @@ def run(cfg: TrainConfig) -> Optional[Dict[str, object]]:
                 pred_len=_aux.get("pred_len"),
                 negs=_negs,
                 neg_mask=_neg_mask,
+                target_span=_b.get("target_span"),
+                pred_span=_aux.get("pred_span"),
             )
             _pred_len = _aux.get("pred_len")
             print(f"  batch {_i}:")
@@ -459,18 +553,7 @@ def run(cfg: TrainConfig) -> Optional[Dict[str, object]]:
         print("\nDRY RUN OK")
         return
 
-    loss_fn = ReconstructionLoss(
-        mse_weight=cfg.mse_weight,
-        cosine_weight=cfg.cosine_weight,
-        norm_weight=cfg.norm_weight,
-        softdtw_weight=cfg.softdtw_weight,
-        infonce_weight=cfg.infonce_weight,
-        length_weight=cfg.length_weight,
-        infonce_temperature=cfg.infonce_temperature,
-        softdtw_gamma=cfg.softdtw_gamma,
-        softdtw_dist=cfg.softdtw_dist,
-        softdtw_normalize=cfg.softdtw_normalize,
-    )
+    loss_fn = build_loss(cfg)
 
     model = build_model(cfg)
     if cfg.pretrained_compressor:
@@ -569,8 +652,15 @@ def run(cfg: TrainConfig) -> Optional[Dict[str, object]]:
             f"cos_token={tm['cos_token']:.4f} cos_seq={tm['cos_seq']:.4f}\n"
             f"             terms | norm={tm['norm']:.4f} soft_dtw={tm['soft_dtw']:.4f} "
             f"info_nce={tm['info_nce']:.4f} length={tm['length']:.4f} "
-            f"norm_ratio={tm['norm_ratio']:.4f}"
+            f"span_iou={tm.get('span_iou', 0.0):.4f} norm_ratio={tm['norm_ratio']:.4f}"
         )
+
+        # under a hard GPU quota (e.g. SLURM --gres=shard), the train-time cached
+        # blocks otherwise stay reserved and the (lighter) val pass tips the
+        # process over the cap. Report the true peak and release the cache first.
+        if device.type == "cuda":
+            print(f"             vram  | peak={torch.cuda.max_memory_allocated() / 1e9:.1f} GB")
+            torch.cuda.empty_cache()
 
         vl, vm = tl, tm
         if vl_ldr:
@@ -580,12 +670,37 @@ def run(cfg: TrainConfig) -> Optional[Dict[str, object]]:
                 f"cos_token={vm['cos_token']:.4f} cos_seq={vm['cos_seq']:.4f}\n"
                 f"             terms | norm={vm['norm']:.4f} soft_dtw={vm['soft_dtw']:.4f} "
                 f"info_nce={vm['info_nce']:.4f} length={vm['length']:.4f} "
-                f"norm_ratio={vm['norm_ratio']:.4f}"
+                f"span_iou={vm.get('span_iou', 0.0):.4f} norm_ratio={vm['norm_ratio']:.4f}"
             )
         history["val_epochs"].append((gs, vl))
 
-        ckpt_score = vl if cfg.checkpoint_metric == "loss" else vm["cos_seq"]
-        is_best = ckpt_score < best_val if cfg.checkpoint_metric == "loss" else ckpt_score > best_val
+        # checkpoint / early-stopping score. "loss" (lower=better) and "cos_seq"
+        # (higher) read the val pass; the retrieval metrics need an extra cross-
+        # sample pass — they select against mode collapse, which the loss does not.
+        if cfg.checkpoint_metric in _LOCAL_CKPT_METRICS and vl_ldr:
+            vloc = _val_localization(model, vl_ldr, device, dtype, cfg)
+            ckpt_score = vloc[cfg.checkpoint_metric]
+            print(
+                f"             val localization | intra_recall@1={vloc['intra_recall@1']:.4f} "
+                f"intra_mrr={vloc['intra_mrr']:.4f} median_rank={vloc['intra_median_rank']:.1f} "
+                f"(select on {cfg.checkpoint_metric})"
+            )
+        elif cfg.checkpoint_metric in _RETRIEVAL_CKPT_METRICS and vl_ldr:
+            vretr = _val_retrieval(model, vl_ldr, device, dtype, cfg)
+            ckpt_score = vretr[cfg.checkpoint_metric]
+            print(
+                f"             val retrieval | recall@1={vretr['recall@1']:.4f} "
+                f"recall@5={vretr['recall@5']:.4f} mrr={vretr['mrr']:.4f} "
+                f"(select on {cfg.checkpoint_metric})"
+            )
+        elif cfg.checkpoint_metric == "span_iou":
+            ckpt_score = vm.get("span_iou", 0.0)   # from the val pass (span head)
+        elif cfg.checkpoint_metric == "cos_seq":
+            ckpt_score = vm["cos_seq"]
+        else:
+            ckpt_score = vl
+        lower_better = cfg.checkpoint_metric == "loss"
+        is_best = ckpt_score < best_val if lower_better else ckpt_score > best_val
         if is_best:
             best_val = ckpt_score
             epochs_since_improve = 0
@@ -665,6 +780,95 @@ def run(cfg: TrainConfig) -> Optional[Dict[str, object]]:
             f"recall@5={retr['recall@5']:.4f} mrr={retr['mrr']:.4f} "
             f"median_rank={retr['median_rank']:.1f} (chance r@1={retr['chance_r1']:.4f})"
         )
+
+        # intra-video localization (the project goal): rank the GT moment among the
+        # SAME video's other moments (temporal negatives).
+        from ..evaluation.retrieval import intra_video_scores
+
+        loc = intra_video_scores(
+            predict_fn=lambda b: m_eval(
+                b["context_tokens"], b["context_mask"],
+                b["question_ids"], b["question_mask"],
+            )[0],
+            move_fn=lambda rb: _move(rb, device, dtype),
+            loader=eval_ldr,
+            max_batches=cfg.max_eval_batches,
+        )
+        final_metrics.update({
+            "intra_recall@1": loc["intra_recall@1"],
+            "intra_mrr": loc["intra_mrr"],
+            "intra_median_rank": loc["intra_median_rank"],
+        })
+        print(
+            f"{eval_split.upper()} localization | intra_recall@1={loc['intra_recall@1']:.4f} "
+            f"intra_mrr={loc['intra_mrr']:.4f} median_rank={loc['intra_median_rank']:.1f} "
+            f"(over same-video moments)"
+        )
+
+        # temporal-grounding span: predicted (start, end) vs GT, IoU-based —
+        # the direct localization output ("return the moment" as a time span).
+        span_ious = []
+        for rb in eval_ldr:
+            b = _move(rb, device, dtype)
+            _, aux_s = m_eval(
+                b["context_tokens"], b["context_mask"],
+                b["question_ids"], b["question_mask"],
+            )
+            ps = aux_s.get("pred_span")
+            if ps is None:
+                break
+            ps = ps.float()
+            ts = b["target_span"].float()
+            inter = (torch.min(ps[:, 1], ts[:, 1]) - torch.max(ps[:, 0], ts[:, 0])).clamp_min(0.0)
+            union = (ps[:, 1] - ps[:, 0]) + (ts[:, 1] - ts[:, 0]) - inter
+            span_ious.append((inter / union.clamp_min(1e-6)).cpu())
+        if span_ious:
+            iou = torch.cat(span_ious)
+            final_metrics.update({
+                "span_miou": float(iou.mean()),
+                "span_recall@0.3": float((iou >= 0.3).float().mean()),
+                "span_recall@0.5": float((iou >= 0.5).float().mean()),
+                "span_recall@0.7": float((iou >= 0.7).float().mean()),
+            })
+            print(
+                f"{eval_split.upper()} span grounding | mIoU={float(iou.mean()):.4f} "
+                f"R@0.3={float((iou >= 0.3).float().mean()):.4f} "
+                f"R@0.5={float((iou >= 0.5).float().mean()):.4f} "
+                f"R@0.7={float((iou >= 0.7).float().mean()):.4f}"
+            )
+
+        # query-usage ablation: re-run retrieval with each prediction conditioned
+        # on another sample's question. A small drop vs the real-query scores means
+        # the model is not using the query to localise the moment.
+        if cfg.ablation_shuffle_query:
+            from ..evaluation.retrieval import shuffle_batch_questions
+
+            def _predict_shuffled(b):
+                s = shuffle_batch_questions(b)
+                return m_eval(
+                    s["context_tokens"], s["context_mask"],
+                    s["question_ids"], s["question_mask"],
+                )[0]
+
+            sh_pred, sh_gt, _ = collect_vectors(
+                predict_fn=_predict_shuffled,
+                move_fn=lambda rb: _move(rb, device, dtype),
+                loader=eval_ldr,
+                max_batches=cfg.max_eval_batches,
+            )
+            retr_sh = retrieval_scores(sh_pred, sh_gt)
+            final_metrics.update({
+                "recall@1_shuffled": retr_sh["recall@1"],
+                "recall@5_shuffled": retr_sh["recall@5"],
+                "mrr_shuffled": retr_sh["mrr"],
+            })
+            d1 = retr["recall@1"] - retr_sh["recall@1"]
+            print(
+                f"{eval_split.upper()} retrieval [shuffled query] | "
+                f"recall@1={retr_sh['recall@1']:.4f} recall@5={retr_sh['recall@5']:.4f} "
+                f"mrr={retr_sh['mrr']:.4f}  -> Δrecall@1={d1:+.4f} "
+                f"({'query USED' if d1 > 0.02 else 'query largely IGNORED'})"
+            )
         if cfg.pca_scatter_path:
             from ..evaluation.plot_space import plot_pred_vs_gt
 

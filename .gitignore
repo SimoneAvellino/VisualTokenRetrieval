@@ -14,3 +14,9 @@ experiments/checkpoints/
 *.log
 
 .DS_Store
+utils.md
+figures/
+
+
+CLAUDE.MD
+.claude

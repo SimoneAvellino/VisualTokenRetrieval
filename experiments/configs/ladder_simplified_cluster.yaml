@@ -1,0 +1,34 @@
+# Model ladder — CLUSTER — SIMPLIFIED mean-token experiment.
+# Runs the trivial baselines, then the simplified MeanReconstructor, and emits
+# the same comparison figures as the main ladder: reconstruction (ladder_progress
+# / metric_comparison / per-step PCA scatter) and retrieval (retrieval_progress).
+#
+# Run:     sh/train_simplyified.sh   (or directly:)
+#          python -m src.training.ladder --config experiments/configs/ladder_simplified_cluster.yaml
+# Resume:  just re-run — finished steps in the summary JSON are skipped.
+
+base_config: experiments/configs/train_simplified_cluster.yaml
+
+results_dir: /home/vllsmn02h03b202i/rosario/results_mean
+figures_dir: /home/vllsmn02h03b202i/rosario/figures_mean
+summary_name: ladder_simplified_summary.json
+
+eval_split: test
+early_stopping_patience: 5
+
+dry_run: false
+dry_run_epochs: 1
+dry_run_max_batches: 4
+
+# trivial, non-trained floors
+baselines:
+  - full_video_mean     # mean of the WHOLE video (uncapped), query-blind
+  - mean_token          # mean of the cropped context (<= max_seq_len)
+
+# trained models (mean model; ablate the contrastive term)
+steps:
+  # 01 disabled: cosine-only ablation already recorded; skip retraining it.
+  # - name: 01_mean_cosine_only
+  #   overrides: {batch_infonce_weight: 0.0, cosine_weight: 1.0}
+  - name: 02_mean_infonce
+    overrides: {batch_infonce_weight: 1.0, cosine_weight: 0.1}

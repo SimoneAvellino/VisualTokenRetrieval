@@ -119,6 +119,10 @@ class QueryConditionedGTReconstructor(nn.Module):
             if decode_mode == "length_aware"
             else None
         )
+        # span head: regress the moment's (start, end) as fractions of query_time,
+        # directly from a pooled query-conditioned summary. This is the temporal-
+        # grounding output — localization that does not rely on token matching.
+        self.span_head = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, 2))
 
     @staticmethod
     def _masked_mean(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -171,10 +175,17 @@ class QueryConditionedGTReconstructor(nn.Module):
         pred = self.out_ln(pred)
 
         aux: Dict[str, torch.Tensor] = {}
+        pooled = pred.mean(1)  # [B, d] query-conditioned summary (internal dim)
         if self.length_head is not None:
             # length head runs at the internal dim, before projecting pred back out
             # softplus -> positive token-count prediction
-            aux["pred_len"] = F.softplus(self.length_head(pred.mean(1)).squeeze(-1))
+            aux["pred_len"] = F.softplus(self.length_head(pooled).squeeze(-1))
+
+        # span head -> (start, end) in [0, 1], with end >= start by construction.
+        raw = self.span_head(pooled)                       # [B, 2]
+        s = torch.sigmoid(raw[:, 0])
+        e = s + (1.0 - s) * torch.sigmoid(raw[:, 1])
+        aux["pred_span"] = torch.stack([s, e], dim=-1)     # [B, 2]
 
         # project predictions back to embed_dim so the loss compares in token space
         pred = self.out_proj(pred)

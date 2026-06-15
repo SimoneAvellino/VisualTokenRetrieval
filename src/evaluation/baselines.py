@@ -7,10 +7,18 @@ learned nothing useful. They are evaluated with exactly the same metrics
 so the numbers are directly comparable on the improvement ladder.
 
 Baselines:
-    - ``mean_token``    — predict the (masked) mean of the context tokens,
+    - ``mean_token``      — predict the (masked) mean of the context tokens,
       repeated for every output position. Ignores the query entirely; measures
-      "how good is just predicting the average token of the video".
-    - ``center_window`` — return the centre window of the context, of the same
+      "how good is just predicting the average token of the video". Note the
+      context is the *cropped* sequence the dataset feeds the model (capped at
+      ``max_seq_len`` and biased toward the GT region).
+    - ``full_video_mean`` — predict the mean of *every* token of the whole video,
+      uncapped (bypasses the ``max_seq_len`` crop by reading the chunk index
+      directly, once per video). Query-blind and identical for all annotations of
+      a video; it also "sees" tokens after the query and the GT itself, so it is
+      a leaky/optimistic floor — useful precisely to bound how much the global
+      video average already resembles any queried moment.
+    - ``center_window``   — return the centre window of the context, of the same
       length as the target. Returns *real* consecutive tokens but located by a
       fixed heuristic rather than by the query; measures the value of locating
       the moment via the question.
@@ -24,11 +32,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from ..datasets.reconstruction_dataset import build_collate_fn
+from ..datasets.token_index import TokenChunkIndex
 from ..models.text_encoder import build_clip_tokenizer
 from ..training.train import TrainConfig, _move, build_splits, resolve_device
 from .metrics import MetricAccumulator, token_metrics
 
-BASELINE_NAMES = ("mean_token", "center_window")
+BASELINE_NAMES = ("mean_token", "full_video_mean", "center_window")
 
 
 def _mean_token_pred(batch: Dict[str, object]) -> torch.Tensor:
@@ -66,6 +75,36 @@ def _center_window_pred(batch: Dict[str, object]) -> torch.Tensor:
     return pred
 
 
+def _make_full_video_mean_pred(
+    chunk_index: TokenChunkIndex,
+) -> Callable[[Dict[str, object]], torch.Tensor]:
+    """Build a predictor returning the mean of the *whole* video's tokens.
+
+    Bypasses the dataset's ``max_seq_len`` crop by reading every chunk of the
+    video straight from the index (``load_range`` with no bounds), then mean-
+    pooling. The per-video mean is computed once and cached — it is identical for
+    every annotation of that video. Output is broadcast to each target's length.
+    """
+    cache: Dict[str, torch.Tensor] = {}
+
+    def predict(batch: Dict[str, object]) -> torch.Tensor:
+        target = batch["target_tokens"]                 # [B, L, D]
+        meta = batch["metadata"]                         # list of dicts
+        b, length, d = target.shape
+        out = target.new_zeros(b, d)
+        for i, m in enumerate(meta):                     # type: ignore[arg-type]
+            vid = str(m["video_id"])                     # type: ignore[index]
+            if vid not in cache:
+                tok, _ = chunk_index.load_range(vid, None, None)
+                cache[vid] = (
+                    tok.mean(0) if tok.numel() > 0 else torch.zeros(d)
+                )
+            out[i] = cache[vid].to(device=out.device, dtype=out.dtype)
+        return out.unsqueeze(1).expand(-1, length, -1).contiguous()
+
+    return predict
+
+
 _BASELINES: Dict[str, Callable[[Dict[str, object]], torch.Tensor]] = {
     "mean_token": _mean_token_pred,
     "center_window": _center_window_pred,
@@ -99,17 +138,20 @@ def evaluate_baseline(
         max_batches: if > 0, stop after this many batches (used by dry-run).
         pca_scatter_path: if set, write the PCA scatter PNG here.
     """
-    if name not in _BASELINES:
-        raise ValueError(f"Unknown baseline {name!r}. Available: {sorted(_BASELINES)}")
-    predict = _BASELINES[name]
+    if name not in BASELINE_NAMES:
+        raise ValueError(f"Unknown baseline {name!r}. Available: {sorted(BASELINE_NAMES)}")
 
     device = resolve_device(cfg.device)
     dtype = torch.bfloat16 if (cfg.dtype == "bf16" and device.type == "cuda") else torch.float32
 
-    tr_ds, vl_ds, ts_ds, _ = build_splits(cfg)
+    _, vl_ds, ts_ds, ci = build_splits(cfg)
     ds = ts_ds if split == "test" else vl_ds
     if ds is None:
         raise ValueError(f"No data for split={split!r}.")
+
+    # full_video_mean needs the chunk index (reads whole videos, uncapped);
+    # the others are pure functions of the batch.
+    predict = _make_full_video_mean_pred(ci) if name == "full_video_mean" else _BASELINES[name]
 
     tok = build_clip_tokenizer(cfg.clip_model)
     cfn = build_collate_fn(tok, cfg.max_question_len)

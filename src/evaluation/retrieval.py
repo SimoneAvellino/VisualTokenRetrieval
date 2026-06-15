@@ -35,6 +35,24 @@ def _masked_mean(t: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return (t * m).sum(1) / m.sum(1).clamp_min(1e-6)
 
 
+def shuffle_batch_questions(batch: Dict[str, object]) -> Dict[str, object]:
+    """Return a shallow copy of ``batch`` with the question tensors rolled by one
+    across the batch axis, so every sample is paired with another sample's query.
+
+    Used by the query-usage ablation: if retrieval scores barely change when each
+    prediction is conditioned on the wrong question, the model is ignoring the
+    query and relying on the video context alone. A roll (not a random permutation)
+    guarantees no sample keeps its own query as long as ``B > 1``.
+    """
+    qids = batch["question_ids"]          # type: ignore[index]
+    n = qids.shape[0]                      # type: ignore[union-attr]
+    idx = torch.roll(torch.arange(n, device=qids.device), shifts=1)  # type: ignore[union-attr]
+    out = dict(batch)
+    out["question_ids"] = qids[idx]                       # type: ignore[index]
+    out["question_mask"] = batch["question_mask"][idx]    # type: ignore[index]
+    return out
+
+
 @torch.no_grad()
 def collect_vectors(
     predict_fn: Callable[[Dict[str, object]], torch.Tensor],
@@ -111,4 +129,62 @@ def retrieval_scores(pred_vecs: np.ndarray, gt_vecs: np.ndarray) -> Dict[str, fl
         "median_rank": float(np.median(ranks)),
         "chance_r1": float(1.0 / n),
         "n": float(n),
+    }
+
+
+@torch.no_grad()
+def intra_video_scores(
+    predict_fn: Callable[[Dict[str, object]], torch.Tensor],
+    move_fn: Callable[[Dict[str, object]], Dict[str, object]],
+    loader: DataLoader,
+    max_batches: int = 0,
+) -> Dict[str, float]:
+    """Intra-video localization: does the prediction rank its GT moment above the
+    *same video's* other moments (the temporal negatives)?
+
+    This is the project's actual goal — locate the moment WITHIN the given video —
+    unlike :func:`retrieval_scores`, whose cross-video pool is dominated by video
+    identity. For each sample the GT (positive) is ranked against its own temporal
+    negatives by cosine to the (pooled) prediction. Requires the loader to provide
+    temporal negatives (``num_temporal_negatives > 0``); samples without negatives
+    are skipped.
+    """
+    import numpy as np
+
+    ranks: List[int] = []
+    for bi, rb in enumerate(loader):
+        if max_batches and bi >= max_batches:
+            break
+        b = move_fn(rb)
+        pred = predict_fn(b).float()                       # [B, *, D]
+        target = b["target_tokens"].float()                # [B, L, D]
+        tmask = b["target_mask"]                            # [B, L]
+        negs = b["negatives"].float()                       # [B, K, Ln, D]
+        nmask = b["negatives_mask"]                         # [B, K, Ln]
+        if negs.shape[1] == 0:
+            continue
+        B, K = negs.shape[0], negs.shape[1]
+        p = torch.nn.functional.normalize(pred.mean(1), dim=-1)            # [B, D]
+        g = torch.nn.functional.normalize(_masked_mean(target, tmask), dim=-1)
+        npool = _masked_mean(
+            negs.reshape(B * K, negs.shape[2], negs.shape[3]),
+            nmask.reshape(B * K, negs.shape[2]),
+        )
+        npool = torch.nn.functional.normalize(npool, dim=-1).reshape(B, K, -1)  # [B, K, D]
+        pos = (p * g).sum(-1, keepdim=True)                 # [B, 1]
+        neg = torch.einsum("bd,bkd->bk", p, npool)          # [B, K]
+        valid = nmask.any(-1)                               # [B, K] real negatives
+        neg = neg.masked_fill(~valid, float("-inf"))
+        rank = 1 + (neg > pos).sum(-1)                      # [B]
+        ranks.extend(int(r) for r in rank.cpu().tolist())
+
+    if not ranks:
+        return {"intra_recall@1": float("nan"), "intra_mrr": float("nan"),
+                "intra_median_rank": float("nan"), "n": 0.0}
+    r = np.array(ranks, dtype=np.float64)
+    return {
+        "intra_recall@1": float((r == 1).mean()),
+        "intra_mrr": float((1.0 / r).mean()),
+        "intra_median_rank": float(np.median(r)),
+        "n": float(len(r)),
     }

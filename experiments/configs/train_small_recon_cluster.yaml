@@ -1,0 +1,108 @@
+# Training — CLUSTER — SMALL moment RECONSTRUCTOR.
+# The full QueryConditionedGTReconstructor (query -> fixed token sequence), but
+# deliberately small for the ~few-hundred-example train set: 1 xLSTM block, 1
+# decoder layer, model_dim 1024, 16 output query slots (= the fixed output token
+# sequence). Trains against the GT token SEQUENCE (length_aware) with a soft-DTW-
+# centric loss + temporal hard negatives. This is the model that actually produces
+# the reconstructed moment (unlike the mean proxy, which pooled to one vector).
+#
+# Run via the ladder:  sh/train_small_recon.sh  ->  ladder_small_recon_cluster.yaml
+
+# paths
+tokens_dir: /home/vllsmn02h03b202i/rosario/visual_tokens/Ego4D
+annotations: /home/vllsmn02h03b202i/rosario/annotations.json
+checkpoint_dir: /home/vllsmn02h03b202i/rosario/checkpoints_small_recon
+pretrained_compressor: ""
+recursive_tokens: false
+
+# device / runtime
+device: auto
+dtype: bf16
+num_workers: 8
+seed: 42
+
+# token loading
+pool_to_fps: 1
+
+# GT window augmentation
+gt_max_left_pad: 30.0
+gt_max_right_pad: 30.0
+gt_window_zero_dur_pad: 5.0
+gt_exact_prob: 0.2
+
+# CLIP
+clip_model: openai/clip-vit-large-patch14
+max_question_len: 77
+
+# data
+context_strategy: full_until_query
+random_crop_extra_min: 16
+random_crop_extra_max: 256
+max_seq_len: 1024             # memory ~ batch_size * max_seq_len * embed_dim(4096)
+out_len: 16                   # output length in FIXED decode (unused in length_aware)
+val_ratio: 0.1
+test_ratio: 0.1
+
+# decode: keep the GT on its native time grid (no time-warp); the moment skews short.
+# Output length tracks the moment (capped at max_out_len), independent of input T.
+# Switch to decode_mode: fixed + out_len for a strictly fixed-length output instead.
+decode_mode: length_aware
+max_out_len: 32               # cap on emitted output tokens (the moment sequence)
+
+# model — SMALL (right-sized for the tiny train set)
+embed_dim: 4096               # must equal the extracted token hidden size
+num_heads: 8
+num_queries: 16               # internal query latents (perceiver), NOT the output length
+decoder_layers: 1
+dropout: 0.2                  # a bit higher than the full model — few data
+memory_mode: z
+xlstm_num_blocks: 1
+xlstm_slstm_at: [0]
+freeze_compressor: false
+model_dim: 1024               # internal width (full model uses larger)
+use_perceiver: true
+perceiver_depth: 1
+multiscale_strides: [1, 4]
+
+# optimization
+batch_size: 4                # bs=16 OOM'd (41 GB): context padded to batch-max len
+gradient_accumulation_steps: 1   # effective batch 4 — same dynamics as bs=1/accum=4
+epochs: 40
+learning_rate: 5.0e-5
+weight_decay: 5.0e-2          # strong — fight overfitting on few examples
+grad_clip: 1.0
+
+# loss — LOCALIZATION via a direct span head (predict the moment's start/end),
+# which trains grounding without token matching (that collapses in the anisotropic
+# space). The span term dominates; reconstruction terms only shape features.
+mse_weight: 0.1
+cosine_weight: 0.1
+norm_weight: 0.05
+softdtw_weight: 0.5           # reconstruction (feature shaping), not the objective
+softdtw_gamma: 0.1
+softdtw_dist: cosine
+softdtw_normalize: false
+infonce_weight: 0.5           # pooled InfoNCE (auxiliary; didn't localize on its own)
+infonce_temperature: 0.07
+num_temporal_negatives: 16    # same-video temporal hard negatives (intra-video eval)
+temporal_neg_max_iou: 0.5
+length_weight: 0.0            # off — unstable; the span head carries localization
+length_warmup_epochs: 0
+span_weight: 2.0              # MAIN: L1 + 1D IoU on the moment's (start, end)
+
+# checkpoint selection + early stopping — select on the span head's temporal IoU
+# (the direct "did it find the moment" signal). Options: span_iou | intra_mrr |
+# intra_recall@1 | mrr | recall@1 | cos_seq | loss.
+checkpoint_metric: span_iou
+early_stopping_patience: 3
+
+# query-usage ablation: also evaluate retrieval with shuffled queries
+ablation_shuffle_query: true
+
+# control flow
+dry_run: false
+resume: ""
+
+# evaluation
+eval_checkpoint: ""
+eval_split: test

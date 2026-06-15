@@ -1,0 +1,28 @@
+# DRY RUN of the SIMPLIFIED mean-token ladder (CLUSTER).
+# Caps epochs/batches so the whole pipeline (baselines + mean model + every
+# figure) runs end-to-end in minutes — validate the wiring before the real run.
+# Artifacts go to *_dry dirs and never touch the real ones.
+# Run: python -m src.training.ladder --config experiments/configs/ladder_simplified_cluster_dry.yaml
+
+base_config: experiments/configs/train_simplified_cluster.yaml
+
+results_dir: /home/vllsmn02h03b202i/rosario/results_mean_dry
+figures_dir: /home/vllsmn02h03b202i/rosario/figures_mean_dry
+summary_name: ladder_simplified_summary.json
+
+eval_split: test
+early_stopping_patience: 5
+
+dry_run: true
+dry_run_epochs: 1
+dry_run_max_batches: 4
+
+baselines:
+  - full_video_mean
+  - mean_token
+
+steps:
+  - name: 01_mean_cosine_only
+    overrides: {batch_infonce_weight: 0.0, cosine_weight: 1.0}
+  - name: 02_mean_infonce
+    overrides: {batch_infonce_weight: 1.0, cosine_weight: 0.1}

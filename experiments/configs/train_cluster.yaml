@@ -76,7 +76,7 @@ softdtw_gamma: 0.1
 softdtw_dist: cosine # cosine | l2
 softdtw_normalize: false
 # temporal hard negatives (Phase 1): same-video shifted windows
-num_temporal_negatives: 4
+num_temporal_negatives: 16
 temporal_neg_max_iou: 0.5
 # length head (Phase 2): SmoothL1 on predicted token count (length_aware only)
 length_weight: 0.1

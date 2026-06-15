@@ -1,0 +1,31 @@
+# Model ladder — CLUSTER — SMALL moment reconstructor.
+# Trivial baselines (full_video_mean, mean_token) + ONE trained model: the small
+# query-conditioned sequence reconstructor. Emits the same comparison figures
+# (ladder_progress / retrieval_progress with Recall@1+@5 / metric_comparison).
+#
+# Run:     sh/train_small_recon.sh   (or:)
+#          python -m src.training.ladder --config experiments/configs/ladder_small_recon_cluster.yaml
+# Resume:  re-run — finished steps in the summary JSON are skipped.
+
+base_config: experiments/configs/train_small_recon_cluster.yaml
+
+results_dir: /home/vllsmn02h03b202i/rosario/results_small_recon
+figures_dir: /home/vllsmn02h03b202i/rosario/figures_small_recon
+summary_name: ladder_small_recon_summary.json
+
+eval_split: test
+early_stopping_patience: 3
+
+dry_run: false
+dry_run_epochs: 1
+dry_run_max_batches: 4
+
+# trivial, non-trained floors
+baselines:
+  - full_video_mean     # mean of the WHOLE video (uncapped), query-blind
+  - mean_token          # mean of the cropped context (<= max_seq_len)
+
+# the one trained model — all hyperparameters come from base_config
+steps:
+  - name: 01_small_recon
+    overrides: {}

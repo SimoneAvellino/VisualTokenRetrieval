@@ -127,6 +127,7 @@ class ReconstructionLoss(nn.Module):
         softdtw_weight: float = 0.0,
         infonce_weight: float = 0.0,
         length_weight: float = 0.0,
+        span_weight: float = 0.0,
         infonce_temperature: float = 0.07,
         softdtw_gamma: float = 0.1,
         softdtw_dist: str = "cosine",
@@ -139,6 +140,7 @@ class ReconstructionLoss(nn.Module):
         self.softdtw_weight = softdtw_weight
         self.infonce_weight = infonce_weight
         self.length_weight = length_weight
+        self.span_weight = span_weight
         self.temperature = infonce_temperature
         self.sdtw = (
             SoftDTW(gamma=softdtw_gamma, normalize=softdtw_normalize, dist=softdtw_dist)
@@ -155,6 +157,8 @@ class ReconstructionLoss(nn.Module):
         pred_len: Optional[torch.Tensor] = None,
         negs: Optional[torch.Tensor] = None,
         neg_mask: Optional[torch.Tensor] = None,
+        target_span: Optional[torch.Tensor] = None,
+        pred_span: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         # length_aware decode emits a fixed `max_out_len` slots; the (padded)
         # target is shorter. Align on the time axis — slots 0..L-1 are supervised
@@ -189,6 +193,23 @@ class ReconstructionLoss(nn.Module):
             length = F.smooth_l1_loss(pred_len, target_lengths.to(pred_len.dtype))
             loss = loss + self.length_weight * length
 
+        # temporal-grounding span loss: L1 + 1D IoU between predicted and GT
+        # (start, end) fractions. This trains localization directly, without token
+        # matching (which collapses in the anisotropic token space).
+        span = pred.new_tensor(0.0)
+        span_iou = pred.new_tensor(0.0)
+        if pred_span is not None and target_span is not None:
+            ps = pred_span.float()
+            ts = target_span.float()
+            inter = (torch.min(ps[:, 1], ts[:, 1]) - torch.max(ps[:, 0], ts[:, 0])).clamp_min(0.0)
+            union = (ps[:, 1] - ps[:, 0]) + (ts[:, 1] - ts[:, 0]) - inter
+            iou = inter / union.clamp_min(1e-6)
+            span_iou = iou.mean()
+            l1 = F.l1_loss(ps, ts)
+            span = l1 + (1.0 - span_iou)
+            if self.span_weight > 0:
+                loss = loss + self.span_weight * span
+
         with torch.no_grad():
             seq_cos = F.cosine_similarity(
                 _masked_mean_time(pred, target_mask),
@@ -215,4 +236,124 @@ class ReconstructionLoss(nn.Module):
             "soft_dtw": float(dtw.detach()),
             "info_nce": float(info_nce.detach()),
             "length": float(length.detach()),
+            "span": float(span.detach()),
+            "span_iou": float(span_iou.detach()),
+        }
+
+
+class MeanInfoNCELoss(nn.Module):
+    """Mean-vector loss for the simplified reconstructor (in-batch InfoNCE + cosine).
+
+    The model predicts a single pooled vector per sample; the target is the
+    masked mean of the GT window tokens. The objective is the *retrieval* one,
+    optimised directly:
+
+        ``loss = infonce_weight * InfoNCE(pred_mean, gt_mean ; in-batch negatives)
+               + cosine_weight  * (1 - cos(pred_mean, own gt_mean))``
+
+    The InfoNCE term contrasts each prediction against its own GT (positive) and
+    every *other* sample's GT in the batch (cross-video negatives) on cosine
+    similarity — the train-time twin of cross-sample retrieval. When the dataset
+    supplies same-video **temporal** negatives (``num_temporal_negatives > 0``),
+    those are added as extra negative columns per sample, so the objective also
+    learns to discriminate moments *within* a video (not just video-vs-video).
+    With temporal negatives the term is active even at ``B == 1`` (the negatives
+    are intra-sample); without them it needs ``B > 1`` and is otherwise skipped,
+    leaving only the cosine anchor. The anchor also keeps the direction aligned in
+    absolute terms (InfoNCE alone only constrains relative similarity).
+
+    Returns the same metric keys as :class:`ReconstructionLoss` (unused terms are
+    reported as ``0.0``) so the training/plotting code is shared verbatim.
+    """
+
+    def __init__(
+        self,
+        infonce_weight: float = 1.0,
+        cosine_weight: float = 0.1,
+        temperature: float = 0.07,
+        symmetric: bool = True,
+    ) -> None:
+        super().__init__()
+        self.infonce_weight = infonce_weight
+        self.cosine_weight = cosine_weight
+        self.temperature = temperature
+        self.symmetric = symmetric
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        target_mask: Optional[torch.Tensor] = None,
+        target_lengths: Optional[torch.Tensor] = None,
+        pred_len: Optional[torch.Tensor] = None,
+        negs: Optional[torch.Tensor] = None,
+        neg_mask: Optional[torch.Tensor] = None,
+        target_span: Optional[torch.Tensor] = None,  # unused (mean model has no span head)
+        pred_span: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        # pred: [B, S, D] (S==1) -> pooled prediction; target: [B, L, D] sequence.
+        p = pred.mean(1)                                   # [B, D]
+        g = _masked_mean_time(target, target_mask)         # [B, D]  true GT mean
+        pn = F.normalize(p, dim=-1)
+        gn = F.normalize(g, dim=-1)
+        B = p.shape[0]
+
+        cos_pair = (pn * gn).sum(-1)                       # [B] own cosine
+        cos_loss = 1.0 - cos_pair.mean()
+        loss = self.cosine_weight * cos_loss
+
+        info_nce = pred.new_tensor(0.0)
+        has_temporal = negs is not None and negs.shape[1] > 0
+        if self.infonce_weight > 0 and (B > 1 or has_temporal):
+            # forward direction (pred -> candidates): in-batch GTs (positive on the
+            # diagonal, other samples as cross-video negatives) plus, when present,
+            # the sample's own same-video temporal hard negatives as extra columns.
+            sim_batch = (pn @ gn.t()) / self.temperature       # [B, B]
+            logits = sim_batch
+            if has_temporal:
+                K = negs.shape[1]
+                nm = (
+                    neg_mask.reshape(B * K, negs.shape[2])
+                    if neg_mask is not None
+                    else None
+                )
+                npool = _masked_mean_time(
+                    negs.reshape(B * K, negs.shape[2], negs.shape[3]), nm
+                )
+                npool = F.normalize(npool, dim=-1).reshape(B, K, -1)   # [B, K, D]
+                sim_temp = torch.einsum("bd,bkd->bk", pn, npool) / self.temperature
+                logits = torch.cat([sim_batch, sim_temp], dim=1)       # [B, B+K]
+            tgt = torch.arange(B, device=pred.device)
+            info_nce = F.cross_entropy(logits, tgt)
+            if self.symmetric and B > 1:
+                # backward direction over the in-batch matrix only — temporal
+                # negatives are pred-anchored and have no symmetric counterpart.
+                info_nce = 0.5 * (info_nce + F.cross_entropy(sim_batch.t(), tgt))
+            loss = loss + self.infonce_weight * info_nce
+
+        with torch.no_grad():
+            # reconstruction diagnostics: pool the N output slots to one vector and
+            # compare it against every (valid) GT token by broadcasting over time.
+            pp = p.unsqueeze(1)                             # [B, 1, D] pooled pred
+            cos_tok = _masked_token_cosine(pp, target, target_mask)
+            mse = _masked_mse(pp, target, target_mask)
+            pnorm = pp.norm(dim=-1)                         # [B, 1]
+            gnorm = target.norm(dim=-1).clamp_min(1e-6)     # [B, L]
+            ratio = pnorm / gnorm                           # broadcast -> [B, L]
+            if target_mask is None:
+                norm_ratio = ratio.mean()
+            else:
+                rm = target_mask.to(ratio.dtype)
+                norm_ratio = (ratio * rm).sum() / rm.sum().clamp_min(1e-6)
+
+        return loss, {
+            "mse": float(mse.detach()),
+            "cos_token": float(cos_tok.detach()),
+            "cos_seq": float(cos_pair.mean().detach()),
+            "cos_loss": float(cos_loss.detach()),
+            "norm": 0.0,
+            "norm_ratio": float(norm_ratio.detach()),
+            "soft_dtw": 0.0,
+            "info_nce": float(info_nce.detach()),
+            "length": 0.0,
         }

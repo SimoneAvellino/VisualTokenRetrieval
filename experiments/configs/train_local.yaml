@@ -73,7 +73,7 @@ softdtw_weight: 1.0           # shift-tolerant main term
 softdtw_gamma: 0.1
 softdtw_dist: cosine
 softdtw_normalize: true
-num_temporal_negatives: 2
+num_temporal_negatives: 8
 temporal_neg_max_iou: 0.5
 length_weight: 0.1
 

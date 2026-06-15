@@ -133,20 +133,30 @@ def plot_retrieval(registry_path: str, output_path: str) -> None:
         return
     metrics = [e["metrics"] for e in entries]  # type: ignore[index]
     r1 = [float(m.get("recall@1", float("nan"))) for m in metrics]  # type: ignore[union-attr]
+    r5 = [float(m.get("recall@5", float("nan"))) for m in metrics]  # type: ignore[union-attr]
     mrr = [float(m.get("mrr", float("nan"))) for m in metrics]  # type: ignore[union-attr]
     chance = next((float(m.get("chance_r1")) for m in metrics  # type: ignore[union-attr]
                    if m.get("chance_r1") is not None), None)
-    colors = [_BASELINE_COLOR if k == "baseline" else _MODEL_COLOR for k in kinds]
+    # Recall@1 is colored by kind (baseline vs model); Recall@5 is a lighter
+    # companion bar next to it so both are visible per model.
+    c1 = [_BASELINE_COLOR if k == "baseline" else _MODEL_COLOR for k in kinds]
 
-    x = list(range(len(names)))
+    import numpy as np
+
+    x = np.arange(len(names))
+    w = 0.4
     fig, ax1 = plt.subplots(figsize=(max(8, 1.4 * len(names)), 6))
-    ax1.bar(x, r1, color=colors, alpha=0.85, zorder=2)
+    ax1.bar(x - w / 2, r1, w, color=c1, alpha=0.9, zorder=2)
+    ax1.bar(x + w / 2, r5, w, color=c1, alpha=0.45, zorder=2, hatch="//", edgecolor="white")
     for xi, v in zip(x, r1):
         if v == v:
-            ax1.text(xi, v, f"{v:.3f}", ha="center", va="bottom", fontsize=9)
+            ax1.text(xi - w / 2, v, f"{v:.3f}", ha="center", va="bottom", fontsize=8)
+    for xi, v in zip(x, r5):
+        if v == v:
+            ax1.text(xi + w / 2, v, f"{v:.3f}", ha="center", va="bottom", fontsize=8)
     if chance is not None:
         ax1.axhline(chance, color="black", ls="--", lw=1.2, label=f"chance (1/N = {chance:.3f})")
-    ax1.set_ylabel("Recall@1 (higher = better)", color=_MODEL_COLOR)
+    ax1.set_ylabel("Recall (higher = better)", color=_MODEL_COLOR)
     ax1.set_xticks(x); ax1.set_xticklabels(names, rotation=30, ha="right", fontsize=9)
     ax1.grid(axis="y", alpha=0.2, zorder=0)
 
@@ -156,14 +166,15 @@ def plot_retrieval(registry_path: str, output_path: str) -> None:
     ax2.tick_params(axis="y", labelcolor="#FF9800")
 
     handles = [
+        plt.Rectangle((0, 0), 1, 1, color=_MODEL_COLOR, label="Recall@1"),
+        plt.Rectangle((0, 0), 1, 1, color=_MODEL_COLOR, alpha=0.45, hatch="//", label="Recall@5"),
         plt.Rectangle((0, 0), 1, 1, color=_BASELINE_COLOR, label="baseline"),
-        plt.Rectangle((0, 0), 1, 1, color=_MODEL_COLOR, label="trained model"),
         mrr_line,
     ]
     if chance is not None:
         handles.append(Line2D([0], [0], color="black", ls="--", label=f"chance = {chance:.3f}"))
     ax1.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.0, 1.01),
-               ncol=4, fontsize=9, frameon=False)
+               ncol=5, fontsize=9, frameon=False)
     fig.suptitle("Retrieval: does the model rank its own moment first?", y=1.02, fontsize=13)
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
     plt.savefig(output_path, dpi=150, bbox_inches="tight")

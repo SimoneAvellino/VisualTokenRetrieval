@@ -75,8 +75,10 @@ class EgoTempoGTReconstructionDataset(Dataset):
         self.gt_sampler = gt_sampler
         self.decode_mode = decode_mode
         self.max_out_len = max_out_len
-        # negatives are a training-only signal (needs the augmentation sampler)
-        self.num_negs = num_temporal_negatives if gt_sampler is not None else 0
+        # temporal negatives are sampled whenever requested (also at eval, where
+        # they serve the intra-video localization metric). Eval (gt_sampler is None)
+        # samples them deterministically; train shuffles.
+        self.num_negs = num_temporal_negatives
         self.neg_max_iou = temporal_neg_max_iou
 
         valid: List[MomentAnnotation] = []
@@ -140,27 +142,41 @@ class EgoTempoGTReconstructionDataset(Dataset):
     def _sample_temporal_negatives(
         self, ann: MomentAnnotation, ws: float, we: float
     ) -> List[torch.Tensor]:
-        """Sample up to ``num_negs`` same-video windows shifted off the GT span.
+        """Sample up to ``num_negs`` same-video windows drawn from before ``query_time``.
 
-        Shifts are multiples of the window duration in both directions. A
-        candidate is rejected if it falls outside the video, has no tokens on
-        disk, or overlaps the GT moment above ``neg_max_iou`` (too easy / too
-        similar to the positive).
+        The observable extent ``[0, query_time]`` is tiled with non-overlapping
+        windows of the GT window's duration; the tiles are shuffled and accepted
+        until ``num_negs`` is reached. A candidate is rejected if it falls outside
+        the video, has no tokens on disk, or overlaps the GT moment above
+        ``neg_max_iou`` (too similar to the positive). Tiling (rather than a fixed
+        handful of shifts) lets the negative count scale with ``num_negs`` and the
+        room available, while staying strictly causal (never past ``query_time``).
         """
         dur = max(1.0, we - ws)
         gt_span = (ann.gt_start, ann.gt_end if ann.gt_end > ann.gt_start else ann.gt_start + 1.0)
-        shifts = [-2.0, -1.5, -1.0, 1.0, 1.5, 2.0]
-        random.shuffle(shifts)
+        # upper bound of the observable timeline; fall back to a generous span
+        # past the GT when query_time is missing (out-of-video reads are pruned
+        # by the empty-tokens check below).
+        upper = ann.query_time if ann.query_time is not None else (ann.gt_end + 300.0)
+
+        # candidate starts: non-overlapping tiles across [0, upper - dur].
+        starts: List[float] = []
+        s = 0.0
+        while s + dur <= upper:
+            starts.append(s)
+            s += dur
+        if self.gt_sampler is not None:
+            random.shuffle(starts)          # train: random subset of tiles
+        elif len(starts) > self.num_negs:
+            # eval: deterministic, evenly-spaced subset (stable intra-video metric)
+            step = len(starts) / float(self.num_negs)
+            starts = [starts[int(i * step)] for i in range(self.num_negs)]
+
         negs: List[torch.Tensor] = []
-        for s in shifts:
+        for ns in starts:
             if len(negs) >= self.num_negs:
                 break
-            ns = ws + s * dur
             ne = ns + dur
-            if ns < 0:
-                continue
-            if ann.query_time is not None and ne > ann.query_time:
-                continue
             if _temporal_iou((ns, ne), gt_span) > self.neg_max_iou:
                 continue
             tok, _ = self.chunk_index.load_range(ann.video_id, ns, ne)
@@ -239,11 +255,21 @@ class EgoTempoGTReconstructionDataset(Dataset):
             )
             return self.__getitem__(random.randint(0, len(self) - 1))
 
+        # GT moment as (start, end) fractions of the observable extent (query_time).
+        # This is the temporal-grounding target for the span head.
+        qt = ann.query_time if (ann.query_time and ann.query_time > 0) else max(ann.gt_end, 1.0)
+        ss = min(max(ann.gt_start / qt, 0.0), 1.0)
+        ee = min(max(ann.gt_end / qt, 0.0), 1.0)
+        if ee <= ss:
+            ee = min(ss + 1e-3, 1.0)
+        target_span = torch.tensor([ss, ee], dtype=torch.float32)
+
         return {
             "context_tokens": ctx,
             "question": ann.question,
             "target_tokens": target,
             "target_len": int(target.shape[0]),
+            "target_span": target_span,
             "negatives": negs,
             "metadata": {
                 "video_id": ann.video_id,
@@ -333,6 +359,7 @@ def build_collate_fn(tokenizer: CLIPTokenizer, max_question_len: int = 77):
             "target_tokens": tgt,
             "target_mask": tmsk,
             "target_len": tlen,
+            "target_span": torch.stack([item["target_span"] for item in batch]),  # [B, 2]
             "negatives": negatives,
             "negatives_mask": neg_mask,
             "metadata": [item["metadata"] for item in batch],

@@ -1,0 +1,27 @@
+# Model ladder — LOCAL (Mac / CPU) — SIMPLIFIED mean-token experiment.
+# dry_run is on: a tiny end-to-end pass that validates the wiring (baselines +
+# mean model + all figures) in minutes before the cluster run.
+# Run: python -m src.training.ladder --config experiments/configs/ladder_simplified_local.yaml
+
+base_config: experiments/configs/train_simplified_local.yaml
+
+results_dir: ./experiments/results_mean
+figures_dir: ./figures/mean
+summary_name: ladder_simplified_summary.json
+
+eval_split: test
+early_stopping_patience: 2
+
+dry_run: true
+dry_run_epochs: 1
+dry_run_max_batches: 2
+
+baselines:
+  - full_video_mean
+  - mean_token
+
+steps:
+  - name: 01_mean_cosine_only
+    overrides: {batch_infonce_weight: 0.0, cosine_weight: 1.0}
+  - name: 02_mean_infonce
+    overrides: {batch_infonce_weight: 1.0, cosine_weight: 0.1}
