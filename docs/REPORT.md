@@ -42,8 +42,6 @@ The data come from a set of annotations over the **Ego4D** dataset. Each annotat
 
 **Augmentation.** Targets are sampled with `GTWindowSampler`: at each epoch a window that always contains `[gt_start, gt_end]` is drawn with independent random left/right padding (up to 30 s each), and with probability 0.2 the exact GT window is used. This exposes the model to varied context around the same moment. Validation/test always use the exact GT window (no augmentation).
 
-[insert numers]
-
 ## 4. Methodology and Architecture
 
 _Detail the experiments and how your system is built. What architecture did you use as a baseline? How did you modify it? Describe the network topology, key layers, the loss function used, and the training logic._
@@ -89,13 +87,13 @@ All retrieval metrics are cross-sample (rank each prediction's own GT moment aga
 
 **Table 1**: Mean model vs. query-blind baselines (retrieval).
 
-| Model                          | Recall@1 | Recall@5 |  MRR   |
-| :----------------------------- | :------: | :------: | :----: |
-| `full_video_mean` (baseline)   |  0.227   |  0.477   |   —    |
-| `mean_token` (baseline)        |  0.205   |  0.455   |   —    |
-| Mean model (InfoNCE + cosine)  |  0.159   |  0.523   | 0.336  |
+| Model                         | Recall@1 | Recall@5 |  MRR  |
+| :---------------------------- | :------: | :------: | :---: |
+| `full_video_mean` (baseline)  |  0.227   |  0.477   |   —   |
+| `mean_token` (baseline)       |  0.205   |  0.455   |   —   |
+| Mean model (InfoNCE + cosine) |  0.159   |  0.523   | 0.336 |
 
-The trained mean model **does not beat the query-blind baselines on Recall@1** (0.159 vs. 0.205–0.227): predicting the global video mean already ranks the right moment surprisingly often, because the cross-video pool is dominated by *video identity*, not by the queried moment. It does improve Recall@5 (0.523), so the correct moment is usually in the top-5, but the top-1 decision is no better than ignoring the video content.
+The trained mean model **does not beat the query-blind baselines on Recall@1** (0.159 vs. 0.205–0.227): predicting the global video mean already ranks the right moment surprisingly often, because the cross-video pool is dominated by _video identity_, not by the queried moment. It does improve Recall@5 (0.523), so the correct moment is usually in the top-5, but the top-1 decision is no better than ignoring the video content.
 
 **Table 2**: Query-usage ablation — same model, each sample re-scored with another sample's (wrong) question.
 
@@ -104,26 +102,26 @@ The trained mean model **does not beat the query-blind baselines on Recall@1** (
 | Right |  0.1591  |  0.5227  | 0.3362 |
 | Wrong |  0.1591  |  0.4773  | 0.3124 |
 
-This is the key diagnostic. Swapping in the wrong question leaves **Recall@1 identical** and barely moves Recall@5 (−0.045) and MRR (−0.024). The model is therefore **largely ignoring the query** — it answers from the video context alone. This directly answers the project's central hypothesis: in the current setup the query does *not* reliably retrieve the correct moment.
+This is the key diagnostic. Swapping in the wrong question leaves **Recall@1 identical** and barely moves Recall@5 (−0.045) and MRR (−0.024). The model is therefore **largely ignoring the query** — it answers from the video context alone. This directly answers the project's central hypothesis: in the current setup the query does _not_ reliably retrieve the correct moment.
 
 ### 5.2 Full reconstructor (token reconstruction ladder)
 
 **Table 3**: Reconstruction vs. retrieval across the loss ladder (`cos_seq` = sequence cosine, higher=better; Recall@1 = cross-sample retrieval).
 
-| Model                       | cos_seq | Recall@1 |
-| :-------------------------- | :-----: | :------: |
-| `mean_token` (baseline)     |  0.692  |  0.205   |
-| `center_window` (baseline)  |  0.493  |  0.205   |
-| `mse_only`                  |  0.681  |  0.068   |
-| `mse_cosine`                |  0.693  |  0.068   |
-| `+ norm`                    |  0.679  |  0.080   |
-| `+ infonce`                 |  0.682  |  0.045   |
-| `infonce_full`              |  0.661  |  0.023   |
-| `small_full`                |  0.649  |  0.045   |
+| Model                      | cos_seq | Recall@1 |
+| :------------------------- | :-----: | :------: |
+| `mean_token` (baseline)    |  0.692  |  0.205   |
+| `center_window` (baseline) |  0.493  |  0.205   |
+| `mse_only`                 |  0.681  |  0.068   |
+| `mse_cosine`               |  0.693  |  0.068   |
+| `+ norm`                   |  0.679  |  0.080   |
+| `+ infonce`                |  0.682  |  0.045   |
+| `infonce_full`             |  0.661  |  0.023   |
+| `small_full`               |  0.649  |  0.045   |
 
 Two facts stand out:
 
-- **Reconstruction looks fine but is uninformative.** Every variant reaches `cos_seq ≈ 0.65–0.69`, on par with the `mean_token` baseline (0.692). Cosine similarity *saturates* in this token space — even predicting the average token scores ~0.69 — so it cannot tell whether the model discriminates the right moment.
+- **Reconstruction looks fine but is uninformative.** Every variant reaches `cos_seq ≈ 0.65–0.69`, on par with the `mean_token` baseline (0.692). Cosine similarity _saturates_ in this token space — even predicting the average token scores ~0.69 — so it cannot tell whether the model discriminates the right moment.
 - **Retrieval collapses.** Despite the good reconstruction numbers, **every trained variant scores far below the query-blind baselines** (0.045–0.080 vs. 0.205), and the most heavily-supervised one (`infonce_full`) lands at chance (0.023). This is **mode collapse**: the reconstruction objective drives predictions toward the global mean token, which minimises the loss while destroying the moment-level discrimination retrieval needs. Adding the contrastive/norm terms did not, on this data scale, pull the model out of the collapsed region.
 
 ### Summary
